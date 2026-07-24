@@ -452,9 +452,7 @@ void fill_feature_report_checksum(std::span<std::uint8_t> report) {
 
 std::vector<std::uint8_t>
 hidp_output_packet(std::span<const std::uint8_t> report) {
-  std::vector<std::uint8_t> packet;
-  packet.reserve(report.size() + 1);
-  packet.push_back(kBtHidpOutputPrefix);
+  std::vector<std::uint8_t> packet{kBtHidpOutputPrefix};
   packet.insert(packet.end(), report.begin(), report.end());
   return packet;
 }

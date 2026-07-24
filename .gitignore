@@ -4,11 +4,10 @@
 
 !/CMakeLists.txt
 !/LICENSE
-!/README.md
-!/README-LINUX.md
-!/README-WINDOWS.md
 !/*.conf
 !/*.in
+!/*.json
+!/*.md
 !/*.ps1
 !/*.rules
 !/*.sh

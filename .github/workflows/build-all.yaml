@@ -172,7 +172,6 @@ jobs:
             $VcpkgPath = "C:\vcpkg\vcpkg.exe"
           }
 
-          & $VcpkgPath install opus:x64-windows
           $VcpkgRoot = Split-Path -Parent $VcpkgPath
           "VDS_VCPKG_ROOT=$VcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
 

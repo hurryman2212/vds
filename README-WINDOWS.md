@@ -40,28 +40,29 @@ USB input URB completion.
 - `git` (for versioning)
 - `cmake` (3.12 or newer)
 - Visual Studio or Visual Studio Build Tools with the C++ toolchain
+- Visual Studio vcpkg component
 - Windows Driver Kit
 - Visual Studio Windows Driver Kit component
 - Windows SDK
 - Opus CMake package
 
-Install the dependencies with `winget` and `vcpkg`; the `winget configure`
-command installs Visual Studio Community with the driver development workloads
-and Windows SDK/WDK components. The driver build script detects the installed
-SDK/WDK version at build time.
+Install the dependencies with `winget`; the Visual Studio vcpkg component
+restores Opus from `vcpkg.json` when CMake configures the project. The driver
+build script detects the installed SDK/WDK version at build time.
 
 ```powershell
+winget configure --enable
 winget install --exact --id Git.Git
 winget install --exact --id Kitware.CMake
-winget configure -f 'https://raw.githubusercontent.com/microsoft/Windows-driver-samples/main/_wdk_utils/winget/configs/wdk-vscommunity.dsc.yaml'
 winget install --exact --id Microsoft.VCRedist.2015+.x64
-vcpkg install opus:x64-windows
+winget install --exact --id Microsoft.VisualStudio.Community --override "--passive --add Microsoft.VisualStudio.Component.Vcpkg"
+winget configure -f "https://raw.githubusercontent.com/microsoft/Windows-driver-samples/main/_wdk_utils/winget/configs/wdk-vscommunity.dsc.yaml" --accept-configuration-agreements --disable-interactivity
 ```
 
 If you use an existing Visual Studio or Build Tools installation instead of the
-WinGet configuration file, add the `Windows Driver Kit` individual component to
-that installation. That component installs the WDK MSBuild integration used by
-the driver projects.
+WinGet configuration file, add the `vcpkg package manager` and
+`Windows Driver Kit` individual components to that installation. The latter
+installs the WDK MSBuild integration used by the driver projects.
 
 ## Driver Install
 
@@ -122,7 +123,24 @@ default.
 Build and install the daemon and CLI with CMake:
 
 ```powershell
-cmake -S . -B build -DINSTALL_SERVICE=YES
+$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$VsInstallPath = & $VsWhere `
+  -latest `
+  -products "*" `
+  -requires Microsoft.VisualStudio.Component.Vcpkg `
+  -property installationPath
+if (!$VsInstallPath) {
+  throw "Visual Studio with the vcpkg component was not found"
+}
+
+$VcpkgToolchain = Join-Path $VsInstallPath "VC\vcpkg\scripts\buildsystems\vcpkg.cmake"
+if (!(Test-Path -LiteralPath $VcpkgToolchain -PathType Leaf)) {
+  throw "vcpkg CMake toolchain was not found: $VcpkgToolchain"
+}
+
+cmake -S . -B build `
+  -DINSTALL_SERVICE=YES `
+  "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
 cmake --build build
 cmake --install build
 ```
@@ -133,11 +151,12 @@ Remove the installed userspace tools with CMake:
 cmake --build build --target uninstall
 ```
 
-The installed tools are:
+The installed files are:
 
 ```text
 C:\Program Files\vDS\vdsd.exe
 C:\Program Files\vDS\vdsctl.exe
+C:\Program Files\vDS\opus.dll
 ```
 
 When `INSTALL_SERVICE=YES` is used, CMake registers `vdsd` as an automatic
