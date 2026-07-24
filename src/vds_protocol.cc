@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
+// Copyright (C) 2026 Antonio <bleader93@gmail.com>
 //
 // Partly influenced by DS5Dongle source:
 // Copyright (c) 2026 awalol, released under the MIT license.
-//
-// Thanks to @TechAntohere for Microphone and Headphones support.
 
 #include <algorithm>
 #include <array>

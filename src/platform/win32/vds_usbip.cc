@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
-// Portions Copyright (C) 2026 Antonio <bleader93@gmail.com>
+// Copyright (C) 2026 Antonio <bleader93@gmail.com>
 
 #include "vds_usbip.hh"
 
