@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "uapi/vds.h"
-#include "unique_handle.hh"
 #include "vds_io.hh"
 
 namespace vds::win {
@@ -39,54 +38,20 @@ public:
 
 struct HidBluetoothDevice {
   std::string path;
+  std::string instance_path;
   std::string address;
   std::string name;
   std::uint32_t profile = VDS_PROFILE_DS5;
   bool profile_valid = false;
-  bool filter_backed = false;
   bool bluetooth_connected = false;
-  bool report_target = false;
-  bool access_restricted = false;
-};
-
-struct HidBluetoothDeviceSnapshot {
-  std::uint32_t generation = 0;
-  std::vector<HidBluetoothDevice> devices;
-};
-
-class FilterBluetoothDeviceChangeWait {
-public:
-  FilterBluetoothDeviceChangeWait();
-  ~FilterBluetoothDeviceChangeWait();
-
-  FilterBluetoothDeviceChangeWait(const FilterBluetoothDeviceChangeWait &) =
-      delete;
-  FilterBluetoothDeviceChangeWait &
-  operator=(const FilterBluetoothDeviceChangeWait &) = delete;
-
-  bool arm(std::uint32_t generation);
-  bool complete();
-  void cancel();
-
-  HANDLE event() const { return event_.get(); }
-  bool pending() const { return pending_; }
-
-private:
-  UniqueHandle handle_;
-  UniqueHandle event_;
-  OVERLAPPED overlapped_{};
-  vds_filter_device_change change_{};
-  bool pending_ = false;
 };
 
 std::optional<HidBluetoothDevice>
-find_filter_bluetooth_device(const std::string &address);
-bool filter_provider_available();
-std::string filter_driver_version();
-HidBluetoothDeviceSnapshot list_filter_bluetooth_device_snapshot();
-std::vector<HidBluetoothDevice> list_filter_bluetooth_devices();
+find_hid_bluetooth_device(const std::string &address);
+std::vector<HidBluetoothDevice> list_hid_bluetooth_devices();
+std::vector<HidBluetoothDevice> list_bluetooth_controller_devices();
 std::string describe_bluetooth_lookup(const std::string &address);
 std::unique_ptr<BluetoothTransport>
-make_filter_bluetooth_transport(const std::string &address);
+make_hid_bluetooth_transport(const std::string &address);
 
 } // namespace vds::win

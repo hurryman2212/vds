@@ -12,6 +12,5 @@
 namespace vds::win {
 
 std::string win32_error_message(DWORD error);
-std::string query_vds_driver_version(HANDLE device);
 
 } // namespace vds::win

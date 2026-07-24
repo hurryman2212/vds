@@ -5,9 +5,6 @@ $script:VdsScriptRoot = if ($PSScriptRoot) {
 } else {
   Split-Path -Parent $MyInvocation.MyCommand.Path
 }
-$script:VdsFallbackDriverDate = "01/01/1970"
-$script:VdsFallbackDriverVersion = "0.1.0.0"
-
 function Invoke-VdsGit {
   param(
     [Parameter(Mandatory = $true)]
@@ -92,27 +89,6 @@ function Compare-VdsSemverTag {
     }
   }
   return 0
-}
-
-function Convert-VdsTagToDriverVersion {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$TagName,
-    [Parameter(Mandatory = $true)]
-    [int]$Distance
-  )
-
-  $Parts = @(Get-VdsSemverParts -TagName $TagName)
-  if ($Parts.Count -ne 4) {
-    return $null
-  }
-
-  $Parts[3] += $Distance
-
-  if ($Parts[3] -gt 65535) {
-    return $null
-  }
-  return "$($Parts[0]).$($Parts[1]).$($Parts[2]).$($Parts[3])"
 }
 
 function Get-VdsVersionTagInfoFromGit {
@@ -235,150 +211,6 @@ function Get-VdsGitVersionFromGit {
   }
 }
 
-function Get-VdsDriverVersionFromGit {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$RepoRoot
-  )
-
-  try {
-    $TagInfo = Get-VdsVersionTagInfoFromGit -RepoRoot $RepoRoot
-    if (!$TagInfo) {
-      return $null
-    }
-    return Convert-VdsTagToDriverVersion `
-      -TagName $TagInfo.Tag `
-      -Distance $TagInfo.Distance
-  } catch {
-    return $null
-  }
-}
-
-function Assert-VdsDriverVersion {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$DriverVersion
-  )
-
-  $Parts = $DriverVersion -split "\."
-  if ($Parts.Count -ne 4) {
-    throw "driver version must use W.X.Y.Z format: $DriverVersion"
-  }
-
-  $ValidatedParts = @()
-  foreach ($Part in $Parts) {
-    [int]$Value = 0
-    if (![int]::TryParse($Part, [ref]$Value)) {
-      throw "driver version contains a non-integer part: $DriverVersion"
-    }
-    if ($Value -lt 0 -or $Value -gt 65535) {
-      throw "driver version part is out of 0..65535 range: $DriverVersion"
-    }
-    $ValidatedParts += $Value
-  }
-  return "$($ValidatedParts[0]).$($ValidatedParts[1]).$($ValidatedParts[2]).$($ValidatedParts[3])"
-}
-
-function Assert-VdsDriverDate {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$DriverDate
-  )
-
-  $Culture = [System.Globalization.CultureInfo]::InvariantCulture
-  $Style = [System.Globalization.DateTimeStyles]::None
-  try {
-    $ParsedDate = [datetime]::ParseExact($DriverDate, "MM/dd/yyyy", $Culture, $Style)
-  } catch {
-    throw "driver date must use MM/dd/yyyy format: $DriverDate"
-  }
-  return $ParsedDate.ToString("MM/dd/yyyy", $Culture)
-}
-
-function Resolve-VdsDriverVer {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$RepoRoot,
-    [string]$DriverVersion = "",
-    [string]$DriverDate = ""
-  )
-
-  $HasVersionOverride = ![string]::IsNullOrWhiteSpace($DriverVersion)
-  $HasDateOverride = ![string]::IsNullOrWhiteSpace($DriverDate)
-  $UsedFallback = $false
-
-  if ($HasVersionOverride) {
-    $ResolvedVersion = Assert-VdsDriverVersion -DriverVersion $DriverVersion
-  } else {
-    $ResolvedVersion = Get-VdsDriverVersionFromGit -RepoRoot $RepoRoot
-    if (!$ResolvedVersion) {
-      $ResolvedVersion = $script:VdsFallbackDriverVersion
-      $UsedFallback = $true
-    }
-    $ResolvedVersion = Assert-VdsDriverVersion -DriverVersion $ResolvedVersion
-  }
-
-  if ($HasDateOverride) {
-    $ResolvedDate = Assert-VdsDriverDate -DriverDate $DriverDate
-  } elseif ($UsedFallback) {
-    $ResolvedDate = $script:VdsFallbackDriverDate
-  } else {
-    $Culture = [System.Globalization.CultureInfo]::InvariantCulture
-    $ResolvedDate = (Get-Date).ToString("MM/dd/yyyy", $Culture)
-  }
-
-  if ($UsedFallback) {
-    Write-Warning "Falling back to DriverVer=$ResolvedDate,$ResolvedVersion"
-  }
-
-  return [pscustomobject]@{
-    Date = $ResolvedDate
-    Version = $ResolvedVersion
-  }
-}
-
-function New-VdsStagedInf {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$TemplatePath,
-    [Parameter(Mandatory = $true)]
-    [string]$OutputPath,
-    [Parameter(Mandatory = $true)]
-    [string]$DriverDate,
-    [Parameter(Mandatory = $true)]
-    [string]$DriverVersion
-  )
-
-  $ResolvedDate = Assert-VdsDriverDate -DriverDate $DriverDate
-  $ResolvedVersion = Assert-VdsDriverVersion -DriverVersion $DriverVersion
-  $Text = [System.IO.File]::ReadAllText($TemplatePath)
-
-  if ($Text.Contains("@VDS_DRIVER_DATE@") -or
-    $Text.Contains("@VDS_DRIVER_VERSION@")) {
-    $Text = $Text.Replace("@VDS_DRIVER_DATE@", $ResolvedDate)
-    $Text = $Text.Replace("@VDS_DRIVER_VERSION@", $ResolvedVersion)
-  } elseif ($Text -match "(?m)^DriverVer\s*=") {
-    $Text = [regex]::Replace(
-      $Text,
-      "(?m)^DriverVer\s*=.*$",
-      "DriverVer=$ResolvedDate,$ResolvedVersion"
-    )
-  } else {
-    throw "INF template does not contain DriverVer: $TemplatePath"
-  }
-
-  if ($Text.Contains("@VDS_DRIVER_DATE@") -or
-    $Text.Contains("@VDS_DRIVER_VERSION@")) {
-    throw "INF template has unresolved DriverVer placeholders: $TemplatePath"
-  }
-
-  [System.IO.File]::WriteAllText(
-    $OutputPath,
-    $Text,
-    [System.Text.Encoding]::ASCII
-  )
-}
-
 function ConvertTo-VdsWindowsPackageVersion {
   param(
     [Parameter(Mandatory = $true)]
@@ -426,16 +258,11 @@ function Resolve-VdsPackageFileName {
 function Show-VdsVersionUsage {
   Write-Output "Usage:"
   Write-Output "  generate_version.ps1 [-Type Tool]"
-  Write-Output "  generate_version.ps1 -Type Kernel [-DriverVersion W.X.Y.Z] [-DriverDate MM/dd/yyyy]"
   Write-Output "  generate_version.ps1 -Type Package [-Name NAME] [-Arch ARCH] [-PkgRel REL]"
   Write-Output ""
   Write-Output "Common options:"
-  Write-Output "  -Type TYPE             Output type: Tool, Package, or Kernel. Defaults to Tool."
+  Write-Output "  -Type TYPE             Output type: Tool or Package. Defaults to Tool."
   Write-Output "  -h, --help             Show this help text."
-  Write-Output ""
-  Write-Output "Kernel options:"
-  Write-Output "  -DriverDate MM/dd/yyyy Override the kernel driver date input."
-  Write-Output "  -DriverVersion W.X.Y.Z Override the kernel driver version input."
   Write-Output ""
   Write-Output "Package options:"
   Write-Output "  -Arch ARCH             Package architecture. Defaults to x64."
@@ -452,8 +279,6 @@ function Invoke-VdsVersionMain {
   $Name = ""
   $PkgRel = ""
   $Arch = "x64"
-  $DriverVersion = ""
-  $DriverDate = ""
   for ($Index = 0; $Index -lt $Arguments.Count; ++$Index) {
     switch ($Arguments[$Index]) {
       "-Type" {
@@ -463,26 +288,10 @@ function Invoke-VdsVersionMain {
           exit 2
         }
         $Type = $Arguments[$Index]
-        if ($Type -notin @("Tool", "Package", "Kernel")) {
-          Write-Error "Type must be Tool, Package, or Kernel: $Type"
+        if ($Type -notin @("Tool", "Package")) {
+          Write-Error "Type must be Tool or Package: $Type"
           exit 2
         }
-      }
-      "-DriverDate" {
-        ++$Index
-        if ($Index -ge $Arguments.Count) {
-          Write-Error "missing value for -DriverDate"
-          exit 2
-        }
-        $DriverDate = $Arguments[$Index]
-      }
-      "-DriverVersion" {
-        ++$Index
-        if ($Index -ge $Arguments.Count) {
-          Write-Error "missing value for -DriverVersion"
-          exit 2
-        }
-        $DriverVersion = $Arguments[$Index]
       }
       "-Arch" {
         ++$Index
@@ -538,14 +347,6 @@ function Invoke-VdsVersionMain {
         -Name $Name `
         -PkgRel $PkgRel `
         -Arch $Arch)
-      return
-    }
-    "Kernel" {
-      $ResolvedDriverVer = Resolve-VdsDriverVer `
-        -RepoRoot $script:VdsScriptRoot `
-        -DriverVersion $DriverVersion `
-        -DriverDate $DriverDate
-      Write-Output "DriverVer=$($ResolvedDriverVer.Date),$($ResolvedDriverVer.Version)"
       return
     }
   }

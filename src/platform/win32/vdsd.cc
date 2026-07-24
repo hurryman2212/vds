@@ -39,10 +39,12 @@
 #include "vds_build_info.hh"
 #include "vds_common.hh"
 #include "vds_config.hh"
+#include "vds_hidhide.hh"
 #include "vds_io.hh"
 #include "vds_log.hh"
 #include "vds_profile.hh"
 #include "vds_protocol.hh"
+#include "vds_usbip.hh"
 #include "vds_win32.hh"
 #include "vdsd_common.hh"
 
@@ -57,9 +59,9 @@ constexpr const char *kDefaultControlPipe = R"(\\.\pipe\vdsd)";
 constexpr const char *kVirtualPortProviderUnavailableReason =
     "virtual port provider unavailable";
 constexpr const char *kWindowsVirtualPortProviderUnavailable =
-    R"(vds_usb driver is not loaded or no \\.\vds# ports are available)";
-constexpr const char *kWindowsFilterProviderUnavailable =
-    R"(vds_filter driver is not loaded or \\.\vds_filter is unavailable)";
+    "usbip-win2 is not installed or usbip.exe is unavailable";
+constexpr const char *kWindowsHidHideProviderUnavailable =
+    "HidHide is not installed or HidHideCLI.exe is unavailable";
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 constexpr std::size_t kMaxPendingAudioChunks = 64;
@@ -124,16 +126,11 @@ using vds::bt_input_to_usb_input;
 using vds::hidp_output_packet;
 using vds::win::BluetoothTransport;
 using vds::win::describe_bluetooth_lookup;
-using vds::win::filter_driver_version;
-using vds::win::filter_provider_available;
-using vds::win::FilterBluetoothDeviceChangeWait;
 using vds::win::Frame;
 using vds::win::HidBluetoothDevice;
-using vds::win::HidBluetoothDeviceSnapshot;
-using vds::win::list_filter_bluetooth_device_snapshot;
-using vds::win::list_filter_bluetooth_devices;
-using vds::win::make_filter_bluetooth_transport;
-using vds::win::query_vds_driver_version;
+using vds::win::list_bluetooth_controller_devices;
+using vds::win::list_hid_bluetooth_devices;
+using vds::win::make_hid_bluetooth_transport;
 using vds::win::UniqueHandle;
 using vds::win::win32_error_message;
 
@@ -454,29 +451,18 @@ find_connected_bluetooth_device(const std::string &address,
     if (vds::normalize_bluetooth_address(device.address) != address) {
       continue;
     }
-    if (device.filter_backed && device.report_target &&
-        device.access_restricted) {
+    if (device.bluetooth_connected) {
       return device;
     }
     if (failure_reason != nullptr) {
-      if (!device.bluetooth_connected) {
-        *failure_reason =
-            "Windows Bluetooth reports address=" + address + " connected=no";
-      } else if (device.report_target && !device.access_restricted) {
-        *failure_reason =
-            "vds_filter sees Bluetooth HID report target for address=" +
-            address + " but physical HID access is not restricted";
-      } else {
-        *failure_reason =
-            "vds_filter sees Bluetooth service for address=" + address +
-            " but no HID report target is present";
-      }
+      *failure_reason =
+          "Windows Bluetooth reports address=" + address + " connected=no";
     }
     return std::nullopt;
   }
 
   if (failure_reason != nullptr) {
-    *failure_reason = "vds_filter did not report a connected Bluetooth HID "
+    *failure_reason = "Windows HID did not report a connected Bluetooth "
                       "device for address=" +
                       address + "; " + describe_bluetooth_lookup(address);
   }
@@ -488,11 +474,11 @@ find_connected_bluetooth_device(const std::string &address,
                                 std::string *failure_reason = nullptr) {
   try {
     return find_connected_bluetooth_device(
-        address, list_filter_bluetooth_device_snapshot().devices,
-        failure_reason);
+        address, list_hid_bluetooth_devices(), failure_reason);
   } catch (const std::exception &error) {
     if (failure_reason != nullptr) {
-      *failure_reason = std::string("vds_filter query failed: ") + error.what();
+      *failure_reason =
+          std::string("Windows HID query failed: ") + error.what();
     }
     return std::nullopt;
   }
@@ -500,7 +486,7 @@ find_connected_bluetooth_device(const std::string &address,
 
 std::vector<vds::ControllerTarget> list_windows_controller_targets() {
   std::vector<vds::ControllerTarget> targets;
-  for (const auto &device : list_filter_bluetooth_devices()) {
+  for (const auto &device : list_bluetooth_controller_devices()) {
     if (!device.profile_valid || device.address.empty()) {
       continue;
     }
@@ -510,53 +496,14 @@ std::vector<vds::ControllerTarget> list_windows_controller_targets() {
         .profile = device.profile == VDS_PROFILE_DSE
                        ? vds::ControllerProfile::Dse
                        : vds::ControllerProfile::Ds5,
-        .online = device.filter_backed && device.report_target &&
-                  device.access_restricted,
+        .online = device.bluetooth_connected,
     });
   }
   return targets;
 }
 
-std::optional<vds_port_info> query_virtual_port_info(unsigned port) {
-  const std::string path = vds::port_path_for_index(port);
-  UniqueHandle handle(CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (!handle) {
-    return std::nullopt;
-  }
-
-  vds_port_info info{};
-  DWORD bytes_returned = 0;
-  if (!DeviceIoControl(handle.get(), VDS_IOCTL_GET_PORT_INFO, nullptr, 0, &info,
-                       sizeof(info), &bytes_returned, nullptr)) {
-    return std::nullopt;
-  }
-  if (bytes_returned != sizeof(info) || info.version != VDS_PORT_INFO_VERSION ||
-      info.size != sizeof(info)) {
-    return std::nullopt;
-  }
-  return info;
-}
-
-std::string query_virtual_port_driver_version(unsigned port) {
-  const std::string path = vds::port_path_for_index(port);
-  UniqueHandle handle(CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (!handle) {
-    throw std::runtime_error("failed to open " + path + ": " +
-                             win32_error_message(GetLastError()));
-  }
-  return query_vds_driver_version(handle.get());
-}
-
 bool virtual_port_is_enabled(unsigned port) {
-  const auto info = query_virtual_port_info(port);
-  if (!info) {
-    return false;
-  }
-  return (info->flags & VDS_PORT_INFO_ENABLED) != 0;
+  return port < vds::kMaxPortCount;
 }
 
 std::vector<unsigned> enabled_virtual_ports() {
@@ -571,16 +518,11 @@ std::vector<unsigned> enabled_virtual_ports() {
 }
 
 bool virtual_port_provider_available() {
-  return !enabled_virtual_ports().empty();
+  return vds::win::usbip::client_available();
 }
 
 bool virtual_port_is_available(unsigned port) {
-  const auto info = query_virtual_port_info(port);
-  if (!info) {
-    return false;
-  }
-  return (info->flags & VDS_PORT_INFO_ENABLED) != 0 &&
-         (info->flags & VDS_PORT_INFO_BOUND) == 0;
+  return virtual_port_is_enabled(port);
 }
 
 std::vector<unsigned> available_virtual_ports() {
@@ -659,17 +601,6 @@ UniqueHandle open_device(const std::string &path) {
   return handle;
 }
 
-UniqueHandle open_device_for_control(const std::string &path) {
-  UniqueHandle handle(CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                  kDeviceShareMode, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (!handle) {
-    throw std::runtime_error("failed to open " + path + ": " +
-                             win32_error_message(GetLastError()));
-  }
-  return handle;
-}
-
 vds::win::HandleIoCancellation handle_io_cancellation() {
   return {
       .stop_event = g_stop_event,
@@ -689,7 +620,7 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
       find_connected_bluetooth_device(config.address, &discovery_error);
   if (!device) {
     if (discovery_error.empty()) {
-      discovery_error = "no matching filter device";
+      discovery_error = "no matching HID device";
     }
     throw std::runtime_error("failed to detect Bluetooth controller profile: " +
                              discovery_error);
@@ -700,64 +631,10 @@ std::uint32_t resolve_virtual_port_profile(const vds::ControllerConfig &config,
                              "profile");
   }
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-             "detected filtered Bluetooth profile=" +
+             "detected Bluetooth profile=" +
                  vds::usb_profile_name(device->profile));
   return device->profile;
 }
-
-class VirtualPortBindingGuard {
-public:
-  VirtualPortBindingGuard(std::string path, std::uint32_t profile,
-                          vds::Logger &logger)
-      : path_(std::move(path)), logger_(logger) {
-    handle_ = open_device_for_control(path_);
-    vds_port_bind bind{
-        .version = VDS_PORT_BIND_VERSION,
-        .size = sizeof(bind),
-        .profile = profile,
-        .flags = 0,
-    };
-    DWORD bytes_returned = 0;
-    if (!DeviceIoControl(handle_.get(), VDS_IOCTL_BIND_PORT, &bind,
-                         sizeof(bind), nullptr, 0, &bytes_returned, nullptr)) {
-      throw std::runtime_error("failed to bind " + path_ + ": " +
-                               win32_error_message(GetLastError()));
-    }
-    active_ = true;
-    logger_.log(vds::LogScope::Usb, vds::LogLevel::Info,
-                "bound " + path_ +
-                    " profile=" + vds::usb_profile_name(profile));
-  }
-
-  ~VirtualPortBindingGuard() {
-    if (!active_) {
-      return;
-    }
-    try {
-      DWORD bytes_returned = 0;
-      if (!DeviceIoControl(handle_.get(), VDS_IOCTL_UNBIND_PORT, nullptr, 0,
-                           nullptr, 0, &bytes_returned, nullptr)) {
-        logger_.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                    "failed to unbind " + path_ + ": " +
-                        win32_error_message(GetLastError()));
-        return;
-      }
-      logger_.log(vds::LogScope::Usb, vds::LogLevel::Info, "unbound " + path_);
-    } catch (const std::exception &error) {
-      logger_.log(vds::LogScope::Usb, vds::LogLevel::Warn,
-                  "failed to unbind " + path_ + ": " + error.what());
-    }
-  }
-
-  VirtualPortBindingGuard(const VirtualPortBindingGuard &) = delete;
-  VirtualPortBindingGuard &operator=(const VirtualPortBindingGuard &) = delete;
-
-private:
-  std::string path_;
-  vds::Logger &logger_;
-  UniqueHandle handle_;
-  bool active_ = false;
-};
 
 bool input_controls_changed(const vds::UsbInputReport &left,
                             const vds::UsbInputReport &right) {
@@ -2170,12 +2047,23 @@ void run_bridge_session(const std::string &device_address,
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge opening virtual=" + virtual_device +
                  " device_address=" + device_address);
+  std::string discovery_error;
+  const auto device =
+      find_connected_bluetooth_device(device_address, &discovery_error);
+  if (!device) {
+    throw std::runtime_error("failed to open Bluetooth controller: " +
+                             discovery_error);
+  }
+  std::unique_ptr<vds::win::hidhide::DeviceGuard> hidden_device =
+      vds::win::hidhide::hide_device(device->instance_path, logger);
   std::unique_ptr<BluetoothTransport> bluetooth =
-      make_filter_bluetooth_transport(device_address);
-  VirtualPortBindingGuard virtual_port_binding(virtual_device, profile, logger);
+      make_hid_bluetooth_transport(device_address);
+  std::unique_ptr<vds::win::usbip::VirtualPort> virtual_port =
+      vds::win::usbip::open_virtual_port(profile, selected_config->ports[0],
+                                         logger);
   BridgeState state;
   std::mutex bluetooth_mutex;
-  UniqueHandle virtual_device_handle = open_device(virtual_device);
+  UniqueHandle virtual_device_handle = open_device(virtual_port->pipe_path());
   std::atomic_bool bridge_restart_requested = false;
   std::thread stop_monitor;
 
@@ -2185,7 +2073,7 @@ void run_bridge_session(const std::string &device_address,
              !session_stop_requested->load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
-      if (session_stop_requested->load()) {
+      if (g_stop_requested.load() || session_stop_requested->load()) {
         request_bridge_restart(virtual_device_handle.get(), bluetooth.get(),
                                bridge_restart_requested);
       }
@@ -2586,7 +2474,7 @@ std::string handle_supervisor_control_command(
         .address = worker->address,
         .connected = worker_is_connected(*worker),
         .path = worker_is_connected(*worker)
-                    ? vds::port_path_for_index(worker->port)
+                    ? vds::win::usbip::endpoint_for_port(worker->port)
                     : "",
     });
   }
@@ -2596,7 +2484,7 @@ std::string handle_supervisor_control_command(
   for (unsigned port = 0; port < vds::kMaxPortCount; ++port) {
     port_candidates.push_back(vds::VdsdControlPortCandidate{
         .port = port,
-        .path = vds::port_path_for_index(port),
+        .path = vds::win::usbip::endpoint_for_port(port),
     });
   }
 
@@ -2634,7 +2522,7 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
       throw std::runtime_error("bridge worker requires one reserved port");
     }
     const std::string virtual_device =
-        vds::port_path_for_index(config.ports[0]);
+        vds::win::usbip::endpoint_for_port(config.ports[0]);
     run_bridge_session(device_address, virtual_device, &config, logger,
                        &stop_requested, &trace_flags);
     if (!g_stop_requested && !stop_requested.load()) {
@@ -2661,7 +2549,6 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
   std::vector<std::string> no_port_warned_addresses;
   std::vector<std::string> port_binding_warned_states;
   ControlPipeServer control_pipe(options.pipe, logger);
-  FilterBluetoothDeviceChangeWait filter_change_wait;
   UniqueHandle retry_timer(CreateWaitableTimerExA(
       nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
       TIMER_MODIFY_STATE | SYNCHRONIZE));
@@ -2674,22 +2561,16 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
                              win32_error_message(GetLastError()));
   }
   std::atomic_uint32_t trace_flags = 0;
-  std::uint32_t filter_generation = 0;
   bool reload_requested = false;
   bool scan_requested = true;
-  bool provider_retry_required = false;
   bool config_load_logged = false;
-  bool filter_provider_warned = false;
-  bool filter_driver_version_logged = false;
   bool virtual_port_provider_warned = false;
-  bool virtual_port_driver_version_logged = false;
   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
              "Windows bridge supervisor started pipe=" + options.pipe);
 
   enum class WaitKind {
     Stop,
     Control,
-    FilterChange,
     Retry,
     WorkerDone,
   };
@@ -2746,9 +2627,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
     }
 
     if (scan_requested) {
-      filter_change_wait.cancel();
       scan_requested = false;
-      provider_retry_required = false;
       try {
         const vds::ConfigDb db = load_config_db_for_attempt(options, logger);
         if (!config_load_logged || reload_requested) {
@@ -2758,14 +2637,20 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           config_load_logged = true;
         }
         const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
-        const bool virtual_port_provider_is_available = !enabled_ports.empty();
+        const bool virtual_port_provider_is_available =
+            !enabled_ports.empty() && vds::win::usbip::client_available() &&
+            vds::win::hidhide::provider_available();
         if (!virtual_port_provider_is_available) {
-          provider_retry_required = true;
-          virtual_port_driver_version_logged = false;
           if (!virtual_port_provider_warned) {
+            std::string detail;
+            if (!vds::win::usbip::client_available()) {
+              detail = kWindowsVirtualPortProviderUnavailable;
+            } else {
+              detail = kWindowsHidHideProviderUnavailable;
+            }
             logger.log(vds::LogScope::Port, vds::LogLevel::Error,
                        std::string(kVirtualPortProviderUnavailableReason) +
-                           " detail=" + kWindowsVirtualPortProviderUnavailable);
+                           " detail=" + detail);
             virtual_port_provider_warned = true;
           }
         } else {
@@ -2774,63 +2659,10 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
                        "virtual port provider recovered");
             virtual_port_provider_warned = false;
           }
-          if (!virtual_port_driver_version_logged) {
-            const std::string path =
-                vds::port_path_for_index(enabled_ports.front());
-            try {
-              logger.log(
-                  vds::LogScope::Port, vds::LogLevel::Info,
-                  "driver connected name=vds_usb version=" +
-                      query_virtual_port_driver_version(enabled_ports.front()) +
-                      " path=" + path);
-            } catch (const std::exception &error) {
-              logger.log(vds::LogScope::Port, vds::LogLevel::Warn,
-                         "driver version unavailable name=vds_usb path=" +
-                             path + " detail=" + error.what());
-            }
-            virtual_port_driver_version_logged = true;
-          }
         }
 
-        const bool filter_provider_is_available = filter_provider_available();
-        HidBluetoothDeviceSnapshot filter_snapshot;
-        if (!filter_provider_is_available) {
-          provider_retry_required = true;
-          filter_driver_version_logged = false;
-          if (!filter_provider_warned) {
-            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
-                       "filter provider unavailable detail=" +
-                           std::string(kWindowsFilterProviderUnavailable));
-            filter_provider_warned = true;
-          }
-        } else {
-          if (filter_provider_warned) {
-            logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-                       "filter provider recovered");
-            filter_provider_warned = false;
-          }
-          if (!filter_driver_version_logged) {
-            try {
-              logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
-                         "driver connected name=vds_filter version=" +
-                             filter_driver_version() +
-                             R"( path=\\.\vds_filter)");
-            } catch (const std::exception &error) {
-              logger.log(
-                  vds::LogScope::Bluetooth, vds::LogLevel::Warn,
-                  R"(driver version unavailable name=vds_filter path=\\.\vds_filter detail=)" +
-                      std::string(error.what()));
-            }
-            filter_driver_version_logged = true;
-          }
-        }
-        if (filter_provider_is_available) {
-          filter_snapshot = list_filter_bluetooth_device_snapshot();
-          filter_generation = filter_snapshot.generation;
-          if (filter_generation == 0) {
-            provider_retry_required = true;
-          }
-        }
+        const std::vector<HidBluetoothDevice> hid_devices =
+            list_hid_bluetooth_devices();
 
         for (const auto &worker : workers) {
           const bool stale = vds::vdsd_worker_config_is_stale(
@@ -2892,25 +2724,14 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
           }
           vds::forget_vdsd_warning_state(port_binding_warned_states,
                                          config.address);
-          if (!filter_provider_is_available) {
-            if (vds::remember_vdsd_warning_state(
-                    discovery_warned_states, config.address,
-                    "filter provider unavailable")) {
-              logger.log(
-                  vds::LogScope::Daemon, vds::LogLevel::Warn,
-                  "controller filter unavailable address=" + config.address +
-                      " reason=filter provider unavailable");
-            }
-            continue;
-          }
           std::string discovery_error;
           const auto connected_device = find_connected_bluetooth_device(
-              config.address, filter_snapshot.devices, &discovery_error);
+              config.address, hid_devices, &discovery_error);
           if (!connected_device) {
             if (vds::remember_vdsd_warning_state(
                     discovery_warned_states, config.address, discovery_error)) {
               logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                         "controller filter unavailable address=" +
+                         "controller HID unavailable address=" +
                              config.address + " reason=" + discovery_error);
             }
             continue;
@@ -2929,7 +2750,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
                     kVirtualPortProviderUnavailableReason)) {
               logger.log(
                   vds::LogScope::Daemon, vds::LogLevel::Warn,
-                  "rejected filter device address=" + config.address +
+                  "rejected HID device address=" + config.address +
                       " reason=" + kVirtualPortProviderUnavailableReason);
             }
             continue;
@@ -2942,7 +2763,7 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
             if (vds::remember_vdsd_warning(no_port_warned_addresses,
                                            config.address)) {
               logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-                         "rejected filter device address=" + config.address +
+                         "rejected HID device address=" + config.address +
                              " reason=no available virtual port");
             }
             continue;
@@ -2983,7 +2804,6 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
                    std::string("Windows bridge supervisor scan failed: ") +
                        error.what());
         scan_requested = true;
-        provider_retry_required = true;
       }
     }
 
@@ -2991,11 +2811,8 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
       reload_requested = false;
     }
 
-    std::optional<Clock::time_point> retry_after;
     const auto now = Clock::now();
-    if (provider_retry_required) {
-      retry_after = now + kBridgeOpenRetryDelay;
-    }
+    std::optional<Clock::time_point> retry_after = now + kBridgeOpenRetryDelay;
     if (!worker_failure_backoffs.empty()) {
       const auto next_retry = std::min_element(
           worker_failure_backoffs.begin(), worker_failure_backoffs.end(),
@@ -3022,33 +2839,8 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
       CancelWaitableTimer(retry_timer.get());
     }
 
-    if (!provider_retry_required && filter_generation != 0) {
-      try {
-        if (!filter_change_wait.pending()) {
-          if (filter_change_wait.arm(filter_generation)) {
-            scan_requested = true;
-            continue;
-          }
-          if (!filter_change_wait.pending()) {
-            scan_requested = true;
-            provider_retry_required = true;
-            continue;
-          }
-        }
-      } catch (const std::exception &error) {
-        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
-                   std::string("filter device-change wait failed: ") +
-                       error.what());
-        scan_requested = true;
-        provider_retry_required = true;
-        continue;
-      }
-    } else {
-      filter_change_wait.cancel();
-    }
-
     std::vector<WaitTarget> wait_targets;
-    wait_targets.reserve(workers.size() + 4);
+    wait_targets.reserve(workers.size() + 3);
     if (g_stop_event != nullptr) {
       wait_targets.push_back(WaitTarget{
           .handle = g_stop_event,
@@ -3061,13 +2853,6 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         .kind = WaitKind::Control,
         .index = 0,
     });
-    if (filter_change_wait.pending()) {
-      wait_targets.push_back(WaitTarget{
-          .handle = filter_change_wait.event(),
-          .kind = WaitKind::FilterChange,
-          .index = 0,
-      });
-    }
     if (retry_timer_armed) {
       wait_targets.push_back(WaitTarget{
           .handle = retry_timer.get(),
@@ -3123,19 +2908,6 @@ void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
         scan_requested = true;
       }
       break;
-    case WaitKind::FilterChange:
-      try {
-        if (filter_change_wait.complete()) {
-          scan_requested = true;
-        }
-      } catch (const std::exception &error) {
-        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Warn,
-                   std::string("filter device-change wait failed: ") +
-                       error.what());
-        scan_requested = true;
-        provider_retry_required = true;
-      }
-      break;
     case WaitKind::Retry:
       CancelWaitableTimer(retry_timer.get());
       scan_requested = true;
@@ -3184,6 +2956,13 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
                      " detail=" + kWindowsVirtualPortProviderUnavailable);
       throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
     }
+    if (!vds::win::hidhide::provider_available()) {
+      logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
+                 std::string(kVirtualPortProviderUnavailableReason) +
+                     " detail=" + kWindowsHidHideProviderUnavailable);
+      throw std::runtime_error(kWindowsHidHideProviderUnavailable);
+    }
+    vds::win::hidhide::register_daemon();
     if (service_mode) {
       update_service_status(SERVICE_RUNNING);
       logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,

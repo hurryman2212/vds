@@ -239,11 +239,6 @@ std::wstring registry_string(HKEY key, const wchar_t *name) {
 bool is_vds_windows_installer_entry(HKEY uninstall_key) {
   const std::wstring display_name =
       registry_string(uninstall_key, L"DisplayName");
-  if (display_name == L"vDS USB Driver" ||
-      display_name == L"vDS Filter Driver") {
-    return true;
-  }
-
   return display_name == L"vDS" &&
          registry_string(uninstall_key, L"Publisher") == L"Jihong Min";
 }
@@ -447,10 +442,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                                      {previous_install_dir});
       (void)status;
     }
-
-    status = run_powershell_script(root / L"windrv\\uninstall.ps1",
-                                   {L"-Target", L"all"});
-    (void)status;
 
     delete_windows_installer_entries();
 

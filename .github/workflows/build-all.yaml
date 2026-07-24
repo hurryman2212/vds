@@ -159,10 +159,6 @@ jobs:
 
           Install-VdsWingetPackage -PackageId Git.Git
           Install-VdsWingetPackage -PackageId Kitware.CMake
-          winget configure `
-            -f https://raw.githubusercontent.com/microsoft/Windows-driver-samples/main/_wdk_utils/winget/configs/wdk-vscommunity.dsc.yaml `
-            --accept-configuration-agreements `
-            --disable-interactivity
           Install-VdsWingetPackage -PackageId Microsoft.VCRedist.2015+.x64
 
           $Vcpkg = Get-Command vcpkg.exe -ErrorAction SilentlyContinue
@@ -189,17 +185,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VDS_VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
           cmake --build build\windows --config Release --parallel
 
-      - name: Build signed driver packages
-        shell: pwsh
-        run: |
-          .\windrv\build.ps1
-
       - name: Build Windows setup package
         shell: pwsh
         run: |
           $Args = @{
             ToolsDir = (Resolve-Path "build\windows\Release").Path
-            DriverPackageRoot = (Resolve-Path "windrv").Path
             OutputDir = (Resolve-Path ".").Path + "\dist\windows"
           }
           if (![string]::IsNullOrWhiteSpace("${{ inputs.windows_pkgrel }}")) {
@@ -261,21 +251,6 @@ jobs:
 
           release_notes="$(mktemp)"
           git log -1 --format=%B "$GITHUB_SHA" > "$release_notes"
-          cat >> "$release_notes" <<'RELEASE_NOTES'
-
-          > [!CAUTION]
-          >
-          > The vDS Windows drivers are experimental. Installing or running them can cause
-          > unexpected system crashes or make Windows fail to boot. Use at your own risk.
-          >
-          > Open an elevated PowerShell session, enable Windows test signing, and reboot
-          > before installing the driver package:
-          >
-          > ```powershell
-          > bcdedit /set testsigning on
-          > shutdown /r /t 0
-          > ```
-          RELEASE_NOTES
 
           if gh release view "$RAW_VERSION" >/dev/null 2>&1; then
             gh release edit "$RAW_VERSION" \

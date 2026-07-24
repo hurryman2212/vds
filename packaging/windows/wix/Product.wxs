@@ -6,17 +6,15 @@
     <Property Id="ARPNOMODIFY" Value="1"/>
     <Property Id="ARPNOREPAIR" Value="1"/>
     <Property Id="INSTALL_USERSPACE" Value="1"/>
+    <Property Id="INSTALL_USBIP" Value="1"/>
+    <Property Id="INSTALL_HIDHIDE" Value="1"/>
     <Property Id="INSTALL_PATH" Value="1" Secure="yes"/>
-    <Property Id="INSTALL_VDS_USB" Value="1"/>
-    <Property Id="INSTALL_VDS_FILTER" Value="1"/>
     <Property Id="ADDLOCAL" Value="MainFeature" Secure="yes"/>
     <Property Id="REMOVE_PROGRAMDATA" Secure="yes"/>
     <Property Id="REINSTALL" Secure="yes"/>
     <Property Id="REINSTALLMODE" Secure="yes"/>
     <Property Id="VDS_REPAIR" Value="0" Secure="yes"/>
     <Property Id="VDS_RERUN_INSTALL" Secure="yes"/>
-    <Property Id="VDS_TESTSIGNING_ENABLED" Secure="yes"/>
-    <Property Id="VDS_TESTSIGNING_RESUME_FAILED" Secure="yes"/>
     <Property Id="VDS_DISPLAY_VERSION" Value="$(var.VdsDisplayVersion)" Secure="yes"/>
     <Property Id="VDS_SETUP_SOURCE" Secure="yes"/>
     <Property Id="VDS_SETUP_LAUNCHED" Secure="yes"/>
@@ -59,8 +57,6 @@
     <CustomAction Id="SetVdsExplicitUninstall" Property="VDS_EXPLICIT_UNINSTALL" Value="1"/>
     <CustomAction Id="SetBrowseProperty" Property="_BrowseProperty" Value="INSTALLFOLDER"/>
     <Binary Id="bin_setup_actions" SourceFile="$(var.SetupActions)"/>
-    <CustomAction Id="CheckTestSigning" BinaryRef="bin_setup_actions" DllEntry="CheckTestSigning" Execute="immediate" Return="check"/>
-    <CustomAction Id="EnableTestSigningAndReboot" BinaryRef="bin_setup_actions" DllEntry="EnableTestSigningAndReboot" Execute="immediate" Return="check"/>
     <CustomAction Id="UpdateDisplayVersion" BinaryRef="bin_setup_actions" DllEntry="UpdateDisplayVersion" Execute="immediate" Return="ignore"/>
     <CustomAction Id="ClearPathMarker" BinaryRef="bin_setup_actions" DllEntry="ClearPathMarker" Execute="deferred" Return="ignore" Impersonate="no"/>
     <CustomAction Id="SetRemoveInstallDirectoriesData" Property="RemoveInstallDirectories" Value="[INSTALLFOLDER]"/>
@@ -84,7 +80,6 @@
     <UI>
       <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9"/>
       <TextStyle Id="WixUI_Font_Title" FaceName="Segoe UI" Size="12" Bold="yes"/>
-      <TextStyle Id="WixUI_Font_Warning" FaceName="Segoe UI" Size="14" Bold="yes" Red="255"/>
       <Property Id="DefaultUIFont" Value="WixUI_Font_Normal"/>
       <ProgressText Action="UninstallExistingInstall" Message="Uninstalling existing vDS installation"/>
       <ProgressText Action="InstallFiles" Message="Installing vDS userspace tools"/>
@@ -105,10 +100,7 @@
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="Back"/>
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next">
           <Publish Event="SpawnDialog" Value="LicenseRequiredDlg" Order="1" Condition="LICENSEACCEPTED &lt;&gt; &quot;1&quot;"/>
-          <Publish Event="DoAction" Value="CheckTestSigning" Order="2" Condition="LICENSEACCEPTED = &quot;1&quot;"/>
-          <Publish Event="NewDialog" Value="WarningDlg" Order="3" Condition="LICENSEACCEPTED = &quot;1&quot; AND VDS_TESTSIGNING_ENABLED = &quot;1&quot;"/>
-          <Publish Event="NewDialog" Value="TestSigningFailedDlg" Order="4" Condition="LICENSEACCEPTED = &quot;1&quot; AND VDS_TESTSIGNING_ENABLED &lt;&gt; &quot;1&quot; AND VDS_TESTSIGNING_RESUME_FAILED = &quot;1&quot;"/>
-          <Publish Event="NewDialog" Value="TestSigningDlg" Order="5" Condition="LICENSEACCEPTED = &quot;1&quot; AND VDS_TESTSIGNING_ENABLED &lt;&gt; &quot;1&quot; AND VDS_TESTSIGNING_RESUME_FAILED &lt;&gt; &quot;1&quot;"/>
+          <Publish Event="NewDialog" Value="ComponentsDlg" Order="2" Condition="LICENSEACCEPTED = &quot;1&quot;"/>
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
           <Publish Event="EndDialog" Value="Exit"/>
@@ -120,77 +112,20 @@
           <Publish Event="EndDialog" Value="Return"/>
         </Control>
       </Dialog>
-      <Dialog Id="TestSigningDlg" Width="370" Height="270" Title="[ProductName] Setup">
-        <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Windows test signing is not enabled"/>
-        <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="vDS test-signed drivers cannot be loaded yet."/>
-        <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
-        <Control Id="Message" Type="Text" X="25" Y="78" Width="320" Height="72" NoPrefix="yes" Text="vDS test-signed drivers cannot be loaded until Windows test signing is enabled and Windows is rebooted."/>
-        <Control Id="Detail" Type="Text" X="25" Y="158" Width="320" Height="48" NoPrefix="yes" Text="Setup can enable test signing now, cache this installer for the next logon, and reboot Windows immediately."/>
-        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
-        <Control Id="Back" Type="PushButton" X="144" Y="243" Width="56" Height="17" Text="Back">
-          <Publish Event="NewDialog" Value="LicenseDlg"/>
-        </Control>
-        <Control Id="EnableAndReboot" Type="PushButton" X="202" Y="243" Width="90" Height="17" Default="yes" Text="Enable and Reboot">
-          <Publish Event="DoAction" Value="EnableTestSigningAndReboot" Order="1"/>
-          <Publish Event="EndDialog" Value="Exit" Order="2"/>
-        </Control>
-        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
-          <Publish Event="EndDialog" Value="Exit"/>
-        </Control>
-      </Dialog>
-      <Dialog Id="TestSigningFailedDlg" Width="370" Height="270" Title="[ProductName] Setup">
-        <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Windows test signing is still disabled"/>
-        <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="vDS setup cannot continue with test-signed drivers."/>
-        <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
-        <Control Id="Message" Type="Text" X="25" Y="78" Width="320" Height="72" NoPrefix="yes" Text="Setup tried to resume after enabling Windows test signing, but test signing is still disabled."/>
-        <Control Id="Detail" Type="Text" X="25" Y="158" Width="320" Height="48" NoPrefix="yes" Text="Secure Boot, administrator policy, or boot configuration may have prevented the change. Setup will close now."/>
-        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
-        <Control Id="Close" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Close">
-          <Publish Event="EndDialog" Value="Exit"/>
-        </Control>
-      </Dialog>
-      <Dialog Id="WarningDlg" Width="370" Height="270" Title="[ProductName] Setup">
-        <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Welcome to the vDS Setup Wizard"/>
-        <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="Please review this warning before installing the Windows drivers."/>
-        <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
-        <Control Id="WarningText1" Type="Text" X="25" Y="70" Width="320" Height="18" NoPrefix="yes" Text="{\WixUI_Font_Warning}Experimental Windows drivers"/>
-        <Control Id="WarningText2" Type="Text" X="25" Y="100" Width="320" Height="44" NoPrefix="yes" Text="Installing or running the vDS Windows drivers can cause unexpected system crashes or make Windows fail to boot."/>
-        <Control Id="WarningDetail" Type="Text" X="25" Y="154" Width="320" Height="36" NoPrefix="yes" Text="Continue only if you understand that this driver package can make the system unstable."/>
-        <Control Id="WarningAcknowledgedCheckBox" Type="CheckBox" X="25" Y="205" Width="320" Height="18" CheckBoxValue="1" Property="WARNINGACKNOWLEDGED" Text="I understand this warning"/>
-        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
-        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back">
-          <Publish Event="NewDialog" Value="LicenseDlg"/>
-        </Control>
-        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next">
-          <Publish Event="SpawnDialog" Value="WarningRequiredDlg" Condition="WARNINGACKNOWLEDGED &lt;&gt; &quot;1&quot;"/>
-          <Publish Event="NewDialog" Value="ComponentsDlg" Condition="WARNINGACKNOWLEDGED = &quot;1&quot;"/>
-        </Control>
-        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
-          <Publish Event="EndDialog" Value="Exit"/>
-        </Control>
-      </Dialog>
-      <Dialog Id="WarningRequiredDlg" Width="260" Height="85" Title="[ProductName] Setup">
-        <Control Id="Message" Type="Text" X="15" Y="15" Width="230" Height="30" NoPrefix="yes" Text="You must acknowledge the driver warning before installing vDS."/>
-        <Control Id="Ok" Type="PushButton" X="102" Y="55" Width="56" Height="17" Default="yes" Cancel="yes" Text="OK">
-          <Publish Event="EndDialog" Value="Return"/>
-        </Control>
-      </Dialog>
       <Dialog Id="ComponentsDlg" Width="370" Height="270" Title="[ProductName] Setup">
         <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Welcome to the vDS Setup Wizard"/>
-        <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="Choose the vDS components to install."/>
+        <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="Choose the vDS components to install. Setup also installs missing USB/IP and HidHide dependencies."/>
         <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
         <Control Id="PackageListTitle" Type="Text" X="25" Y="64" Width="205" Height="12" NoPrefix="yes" Text="Packages:"/>
-        <Control Id="PackageBox" Type="GroupBox" X="25" Y="78" Width="205" Height="124"/>
-        <Control Id="UserspaceTools" Type="CheckBox" X="40" Y="94" Width="175" Height="18" CheckBoxValue="1" Property="INSTALL_USERSPACE" Disabled="yes" Text="Userspace tools"/>
-        <Control Id="AddToPath" Type="CheckBox" X="58" Y="116" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_PATH" Text="Add install directory to PATH"/>
-        <Control Id="KernelDriverLabel" Type="Text" X="40" Y="140" Width="175" Height="14" NoPrefix="yes" Text="Kernel driver"/>
-        <Control Id="VdsUsbDriver" Type="CheckBox" X="58" Y="158" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_USB" Disabled="yes" Text="vds_usb.sys"/>
-        <Control Id="VdsFilterDriver" Type="CheckBox" X="58" Y="180" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_VDS_FILTER" Disabled="yes" Text="vds_filter.sys"/>
-        <Control Id="UserspaceDetails" Type="Text" X="244" Y="84" Width="104" Height="62" NoPrefix="yes" Text="Installs vdsd.exe, vdsctl.exe, the runtime DLL, and the vdsd Windows service."/>
-        <Control Id="DriverDetails" Type="Text" X="244" Y="154" Width="104" Height="48" NoPrefix="yes" Text="Installs the required Windows kernel driver packages."/>
+        <Control Id="PackageBox" Type="GroupBox" X="25" Y="78" Width="205" Height="118"/>
+        <Control Id="UserspaceTools" Type="CheckBox" X="40" Y="92" Width="175" Height="18" CheckBoxValue="1" Property="INSTALL_USERSPACE" Disabled="yes" Text="Userspace tools"/>
+        <Control Id="AddToPath" Type="CheckBox" X="58" Y="112" Width="160" Height="18" CheckBoxValue="1" Property="INSTALL_PATH" Text="Add install directory to PATH"/>
+        <Control Id="Usbip" Type="CheckBox" X="40" Y="136" Width="175" Height="18" CheckBoxValue="1" Property="INSTALL_USBIP" Disabled="yes" Text="USB/IP client (usbip-win2)"/>
+        <Control Id="HidHide" Type="CheckBox" X="40" Y="160" Width="175" Height="18" CheckBoxValue="1" Property="INSTALL_HIDHIDE" Disabled="yes" Text="HidHide"/>
+        <Control Id="UserspaceDetails" Type="Text" X="244" Y="84" Width="104" Height="96" NoPrefix="yes" Text="Installs vdsd.exe, vdsctl.exe, the runtime DLL, and the vdsd Windows service. Missing USB/IP and HidHide dependencies are downloaded separately."/>
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Back">
-          <Publish Event="NewDialog" Value="WarningDlg"/>
+          <Publish Event="NewDialog" Value="LicenseDlg"/>
         </Control>
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next">
           <Publish Event="NewDialog" Value="InstallDirDlg"/>
@@ -261,7 +196,7 @@
         <Control Id="Title" Type="Text" X="15" Y="6" Width="340" Height="18" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Remove vDS"/>
         <Control Id="Description" Type="Text" X="25" Y="26" Width="330" Height="24" Transparent="yes" NoPrefix="yes" Text="Choose whether to remove vDS from this computer."/>
         <Control Id="TopLine" Type="Line" X="0" Y="50" Width="370" Height="0"/>
-        <Control Id="Message" Type="Text" X="25" Y="80" Width="320" Height="48" NoPrefix="yes" Text="Setup will remove the vDS userspace tools and installed driver package state managed by this installer."/>
+        <Control Id="Message" Type="Text" X="25" Y="80" Width="320" Height="48" NoPrefix="yes" Text="Setup will remove the vDS userspace tools managed by this installer. USB/IP and HidHide are shared dependencies and will remain installed."/>
         <Control Id="RemoveProgramData" Type="CheckBox" X="25" Y="148" Width="320" Height="18" CheckBoxValue="1" Property="REMOVE_PROGRAMDATA" Text="Remove C:\ProgramData\vDS"/>
         <Control Id="RemoveProgramDataNote" Type="Text" X="45" Y="172" Width="300" Height="36" NoPrefix="yes" Text="This deletes vdsd.db and vdsd.log. Leave unchecked to keep controller registrations and logs."/>
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0"/>

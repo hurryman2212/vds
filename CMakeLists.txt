@@ -100,7 +100,20 @@ if(WIN32)
   target_include_directories(vds_bt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                            ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(vds_bt PUBLIC vds_protocol vds_common vds_io hid
-                                      setupapi bthprops)
+                                      setupapi bthprops cfgmgr32)
+
+  add_library(vds_hidhide OBJECT src/platform/win32/vds_hidhide.cc)
+  target_include_directories(
+    vds_hidhide PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                       ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(vds_hidhide PUBLIC vds_log vds_win32)
+
+  add_library(vds_usbip OBJECT src/platform/win32/vds_usbip.cc)
+  target_include_directories(
+    vds_usbip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(vds_usbip PUBLIC vds_protocol vds_io vds_log vds_win32
+                                        ws2_32 winmm)
 
   add_executable(vdsd src/platform/win32/vdsd.cc)
   add_dependencies(vdsd vds_build_info_header)
@@ -112,8 +125,10 @@ if(WIN32)
             vds_bt
             vds_common
             vds_config
+            vds_hidhide
             vds_log
             vds_io
+            vds_usbip
             vds_win32
             vdsd_common
             winmm)
@@ -126,10 +141,8 @@ if(WIN32)
     vdsctl
     PRIVATE vds_protocol
             jsonl
-            vds_bt
             vds_common
             vds_config
-            vds_io
             vds_win32
             vdsctl_common
             advapi32)

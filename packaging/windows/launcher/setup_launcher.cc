@@ -273,6 +273,27 @@ bool is_success_exit_code(int status) {
   return status == 0 || status == 3010 || status == 1641;
 }
 
+bool is_restart_exit_code(int status) {
+  return status == 3010 || status == 1641;
+}
+
+int run_dependency_script(const std::filesystem::path &script,
+                          const std::filesystem::path &download_dir,
+                          std::wstring_view mode) {
+  std::wstring command_line = quote_command_argument(
+      system_executable(L"WindowsPowerShell\\v1.0\\powershell.exe").wstring());
+  command_line += L" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy "
+                  L"Bypass -WindowStyle Hidden -File ";
+  command_line += quote_command_argument(script.wstring());
+  command_line += L" -Mode ";
+  command_line += mode;
+  command_line += L" -DownloadDir ";
+  command_line += quote_command_argument(download_dir.wstring());
+  command_line += L" -LogPath ";
+  command_line += quote_command_argument(installer_log_path().wstring());
+  return run_process(std::move(command_line), SW_HIDE);
+}
+
 struct ServiceHandle {
   SC_HANDLE value = nullptr;
 
@@ -567,7 +588,7 @@ void start_vdsd_service() {
 }
 
 void append_msi_log_arguments(std::wstring &command_line) {
-  command_line += L" /l*vx! ";
+  command_line += L" /l*vx+! ";
   command_line += quote_command_argument(installer_log_path().wstring());
 }
 
@@ -597,28 +618,6 @@ int run_main_msi_uninstall(const std::filesystem::path &msi,
   command_line += L" /norestart";
   append_msi_log_arguments(command_line);
   return run_process(std::move(command_line), SW_SHOWNORMAL);
-}
-
-int run_driver_msi(const std::filesystem::path &msi) {
-  std::wstring command_line =
-      quote_command_argument(system_executable(L"msiexec.exe").wstring());
-  command_line += L" /i ";
-  command_line += quote_command_argument(msi.wstring());
-  command_line += L" VDS_FORCE_DRIVER_INSTALL=1";
-  command_line += L" /passive /norestart";
-  append_msi_log_arguments(command_line);
-  return run_process(std::move(command_line), SW_SHOWNORMAL);
-}
-
-void reboot_now(bool write_log = true) {
-  std::wstring command_line =
-      quote_command_argument(system_executable(L"shutdown.exe").wstring());
-  command_line += L" /r /t 0";
-  if (write_log) {
-    run_process(std::move(command_line), SW_HIDE);
-  } else {
-    launch_process(std::move(command_line), SW_HIDE);
-  }
 }
 
 void remove_setup_cache_after_exit() {
@@ -651,39 +650,6 @@ void remove_setup_cache_after_exit() {
             L"}";
   command_line += quote_command_argument(script);
   launch_process(std::move(command_line), SW_HIDE);
-}
-
-void prompt_reboot() {
-  const int choice = MessageBoxW(
-      nullptr,
-      L"vDS setup has finished installing the selected components.\n\n"
-      L"A Windows reboot is required before using vDS.\n\n"
-      L"Reboot now?",
-      L"vDS Setup",
-      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND |
-          MB_TOPMOST);
-  if (choice == IDYES) {
-    reboot_now();
-  }
-}
-
-bool prompt_reboot_after_uninstall() {
-  const int choice = MessageBoxW(
-      nullptr,
-      L"vDS has been removed from this computer.\n\n"
-      L"A Windows reboot is required before reinstalling vDS or using "
-      L"Bluetooth controller devices normally.\n\n"
-      L"Reboot now?",
-      L"vDS Setup",
-      MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_SETFOREGROUND |
-          MB_TOPMOST);
-  if (choice == IDYES) {
-    append_installer_log(L"user accepted reboot after uninstall");
-    return true;
-  } else {
-    append_installer_log(L"user declined reboot after uninstall");
-    return false;
-  }
 }
 
 void show_failed_status(const wchar_t *stage, int status) {
@@ -746,6 +712,40 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     write_payloads(work_dir);
     append_installer_log(L"payloads extracted");
 
+    const std::filesystem::path dependency_script =
+        work_dir / L"install_dependencies.ps1";
+    const std::filesystem::path dependency_download_dir =
+        work_dir / L"dependencies";
+    if (!uninstall) {
+      const int response = MessageBoxW(
+          nullptr,
+          L"vDS requires USB/IP and HidHide.\n\n"
+          L"Setup will download the latest stable x64 installers from their "
+          L"official GitHub releases when either dependency is missing. Each "
+          L"download must have a valid Windows digital signature.\n\n"
+          L"The USB/IP project recommends creating a Windows system restore "
+          L"point before installation. Installing USB/IP also temporarily "
+          L"restarts USB 3 hubs. Connected USB devices may disconnect, so save "
+          L"any work that uses them before continuing.\n\n"
+          L"Already installed dependencies are left unchanged. Continue?",
+          L"vDS Setup", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+      if (response != IDOK) {
+        std::filesystem::remove_all(work_dir);
+        append_installer_log(L"dependency installation was canceled");
+        return ERROR_CANCELLED;
+      }
+
+      const int download_status = run_dependency_script(
+          dependency_script, dependency_download_dir, L"Download");
+      if (!is_success_exit_code(download_status)) {
+        show_failed_status(L"downloading and verifying dependencies",
+                           download_status);
+        std::filesystem::remove_all(work_dir);
+        append_installer_log(L"dependency download failed");
+        return download_status;
+      }
+    }
+
     const std::filesystem::path main_msi = work_dir / L"vDS-setup.msi";
     const int main_status =
         uninstall ? run_main_msi_uninstall(main_msi, current_executable_path())
@@ -771,9 +771,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       std::filesystem::remove_all(work_dir);
       remove_setup_cache_after_exit();
       append_installer_log(L"vDS setup uninstall finished");
-      const bool reboot_requested = prompt_reboot_after_uninstall();
 
-      bool program_data_removed = false;
       if (remove_program_data) {
         append_installer_log(L"removing vDS ProgramData after MSI exit");
         std::error_code error;
@@ -789,16 +787,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                       L"vDS was uninstalled, but C:\\ProgramData\\vDS could "
                       L"not be removed.",
                       L"vDS Setup", MB_OK | MB_ICONWARNING);
-        } else {
-          program_data_removed = true;
         }
-      }
-
-      if (reboot_requested) {
-        reboot_now(!program_data_removed);
       }
       return 0;
     }
+
+    bool restart_required = is_restart_exit_code(main_status);
+    const int dependency_status = run_dependency_script(
+        dependency_script, dependency_download_dir, L"Install");
+    if (!is_success_exit_code(dependency_status)) {
+      show_failed_status(L"installing USB/IP and HidHide", dependency_status);
+      std::filesystem::remove_all(work_dir);
+      append_installer_log(
+          L"dependency installation failed after the vDS MSI completed");
+      return dependency_status;
+    }
+    restart_required =
+        restart_required || is_restart_exit_code(dependency_status);
 
     const std::filesystem::path install_dir = installed_vds_dir();
     {
@@ -808,29 +813,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     ensure_vdsd_service_registered(install_dir);
     ensure_machine_path(install_dir);
-
-    int driver_status = run_driver_msi(work_dir / L"vDS-usb-setup.msi");
-    if (!is_success_exit_code(driver_status)) {
-      show_failed_status(L"installing vds_usb.sys", driver_status);
-      std::filesystem::remove_all(work_dir);
-      append_installer_log(L"vds_usb installer failed");
-      return driver_status;
+    if (restart_required) {
+      append_installer_log(
+          L"vdsd service start deferred until Windows restarts");
+    } else {
+      start_vdsd_service();
     }
 
-    driver_status = run_driver_msi(work_dir / L"vDS-filter-setup.msi");
-    if (!is_success_exit_code(driver_status)) {
-      show_failed_status(L"installing vds_filter.sys", driver_status);
-      std::filesystem::remove_all(work_dir);
-      append_installer_log(L"vds_filter installer failed");
-      return driver_status;
-    }
-
-    ensure_vdsd_service_registered(install_dir);
-    start_vdsd_service();
-
-    prompt_reboot();
     std::filesystem::remove_all(work_dir);
     append_installer_log(L"vDS setup install finished");
+    if (restart_required) {
+      MessageBoxW(nullptr,
+                  L"vDS was installed successfully. Restart Windows before "
+                  L"using vDS to finish installing USB/IP and HidHide.",
+                  L"vDS Setup", MB_OK | MB_ICONINFORMATION);
+      return 3010;
+    }
     return 0;
   } catch (const std::exception &error) {
     if (!work_dir.empty()) {

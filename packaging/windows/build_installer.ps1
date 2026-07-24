@@ -3,13 +3,16 @@
 param(
   [string]$OutputDir = "",
   [string]$ToolsDir = "",
-  [string]$DriverPackageRoot = "",
   [string]$PkgRel = "",
   [string]$Arch = "x64",
   [string]$Wix = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Arch -ne "x64") {
+  throw "the Windows USB/IP and HidHide dependency stack only supports -Arch x64"
+}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
@@ -35,8 +38,13 @@ function Resolve-VdsOutputDir {
 }
 
 function Resolve-VdsMsiVersion {
-  $VersionInfo = Resolve-VdsDriverVer -RepoRoot $RepoRoot
-  $Parts = $VersionInfo.Version -split "\."
+  $TagInfo = Get-VdsVersionTagInfoFromGit -RepoRoot $RepoRoot
+  if (!$TagInfo) {
+    Write-Warning "Falling back to MSI version 0.1.0"
+    return "0.1.0"
+  }
+
+  $Parts = @(Get-VdsSemverParts -TagName $TagInfo.Tag)
   return "$($Parts[0]).$($Parts[1]).$($Parts[2])"
 }
 
@@ -92,51 +100,6 @@ function Resolve-VdsToolsDir {
   }
 
   throw "tools directory was not found. Build vdsd.exe/vdsctl.exe first or pass -ToolsDir."
-}
-
-function Test-VdsDriverPackageRoot {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Path
-  )
-
-  if ([string]::IsNullOrWhiteSpace($Path)) {
-    return $false
-  }
-
-  $RequiredFiles = @(
-    "vds_usb\package\vds_usb.inf",
-    "vds_usb\package\vds_usb.sys",
-    "vds_usb\package\vds_usb.cat",
-    "vds_usb\vds_usb.reg",
-    "vds_filter\package\vds_filter.inf",
-    "vds_filter\package\vds_filter.sys",
-    "vds_filter\package\vds_filter.cat",
-    "vds_filter\package\vds_test_driver.cer"
-  )
-  foreach ($FileName in $RequiredFiles) {
-    if (!(Test-Path -LiteralPath (Join-Path $Path $FileName) -PathType Leaf)) {
-      return $false
-    }
-  }
-  return $true
-}
-
-function Resolve-VdsDriverPackageRoot {
-  if (![string]::IsNullOrWhiteSpace($DriverPackageRoot)) {
-    $Resolved = Resolve-VdsPath -Path $DriverPackageRoot
-    if (!(Test-VdsDriverPackageRoot -Path $Resolved)) {
-      throw "driver package root does not contain signed vDS driver packages: $Resolved"
-    }
-    return $Resolved
-  }
-
-  $Candidate = Join-Path $RepoRoot "windrv"
-  if (Test-VdsDriverPackageRoot -Path $Candidate) {
-    return Resolve-VdsPath -Path $Candidate
-  }
-
-  throw "driver package root was not found. Build Windows drivers first or pass -DriverPackageRoot."
 }
 
 function ConvertTo-RtfEscapedText {
@@ -233,11 +196,6 @@ function New-UninstallPayloadHeader {
       Symbol = "kPayloadUninstallEnvPs1"
       RelativePath = "uninstall_env.ps1"
       SourcePath = Join-Path $RepoRoot "uninstall_env.ps1"
-    },
-    [pscustomobject]@{
-      Symbol = "kPayloadWindrvUninstallPs1"
-      RelativePath = "windrv\\uninstall.ps1"
-      SourcePath = Join-Path $RepoRoot "windrv\uninstall.ps1"
     }
   )
 
@@ -283,10 +241,6 @@ function New-SetupPayloadHeader {
     [Parameter(Mandatory = $true)]
     [string]$MainMsiPath,
     [Parameter(Mandatory = $true)]
-    [string]$UsbMsiPath,
-    [Parameter(Mandatory = $true)]
-    [string]$FilterMsiPath,
-    [Parameter(Mandatory = $true)]
     [string]$DisplayVersion
   )
 
@@ -297,14 +251,9 @@ function New-SetupPayloadHeader {
       SourcePath = $MainMsiPath
     },
     [pscustomobject]@{
-      Symbol = "kPayloadUsbMsi"
-      FileName = "vDS-usb-setup.msi"
-      SourcePath = $UsbMsiPath
-    },
-    [pscustomobject]@{
-      Symbol = "kPayloadFilterMsi"
-      FileName = "vDS-filter-setup.msi"
-      SourcePath = $FilterMsiPath
+      Symbol = "kPayloadInstallDependenciesPs1"
+      FileName = "install_dependencies.ps1"
+      SourcePath = Join-Path $ScriptDir "install_dependencies.ps1"
     }
   )
 
@@ -458,8 +407,7 @@ function Build-NativeLauncher {
     [Parameter(Mandatory = $true)]
     [string]$OutputPath,
     [string]$IncludeDir = "",
-    [string]$ManifestPath = "",
-    [string[]]$LinkLibraries = @()
+    [string]$ManifestPath = ""
   )
 
   $Args = @(
@@ -484,9 +432,6 @@ function Build-NativeLauncher {
     "Shell32.lib",
     "User32.lib"
   )
-  foreach ($Library in $LinkLibraries) {
-    $Args += $Library
-  }
   if (![string]::IsNullOrWhiteSpace($ManifestPath)) {
     $Args += @(
       "/MANIFEST:EMBED",
@@ -546,7 +491,6 @@ if ([string]::IsNullOrWhiteSpace($ResolvedDisplayVersion)) {
 }
 $ResolvedWix = Resolve-Wix
 $ResolvedToolsDir = Resolve-VdsToolsDir
-$ResolvedDriverPackageRoot = Resolve-VdsDriverPackageRoot
 
 $PackageFileNameArgs = @{
   Name = "vDSSetup"
@@ -559,8 +503,6 @@ $SetupExeFileName = Resolve-VdsPackageFileName @PackageFileNameArgs
 $SetupPath = Join-Path $ResolvedOutputDir $SetupExeFileName
 
 $UninstallRunnerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\uninstall_runner.cc")
-$DriverScriptRunnerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\driver_script_runner.cc")
-$RootDeviceInstallerSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\root_device_installer.cc")
 $SetupActionsSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\setup_actions.cc")
 $SetupLauncherSource = Resolve-VdsPath -Path (Join-Path $ScriptDir "launcher\setup_launcher.cc")
 
@@ -569,12 +511,8 @@ $UninstallPayloadHeader = Join-Path $GeneratedDir "uninstall_payload.hh"
 $SetupPayloadHeader = Join-Path $GeneratedDir "setup_payload.hh"
 $SetupLauncherManifest = Join-Path $GeneratedDir "setup-launcher.manifest"
 $UninstallRunnerPath = Join-Path $GeneratedDir "vds-uninstall-runner.exe"
-$DriverScriptRunnerPath = Join-Path $GeneratedDir "vds-driver-script-runner.exe"
-$RootDeviceInstallerPath = Join-Path $GeneratedDir "vds-root-device-installer.exe"
 $SetupActionsPath = Join-Path $GeneratedDir "vds-setup-actions.dll"
 $MainMsiPath = Join-Path $GeneratedDir "vDS-setup.msi"
-$UsbMsiPath = Join-Path $GeneratedDir "vDS-usb-setup.msi"
-$FilterMsiPath = Join-Path $GeneratedDir "vDS-filter-setup.msi"
 
 New-Item -ItemType Directory -Force -Path $GeneratedDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ResolvedOutputDir | Out-Null
@@ -585,41 +523,9 @@ Build-NativeLauncher `
   -SourcePath $UninstallRunnerSource `
   -OutputPath $UninstallRunnerPath `
   -IncludeDir $GeneratedDir
-Build-NativeLauncher `
-  -SourcePath $DriverScriptRunnerSource `
-  -OutputPath $DriverScriptRunnerPath
-Build-NativeLauncher `
-  -SourcePath $RootDeviceInstallerSource `
-  -OutputPath $RootDeviceInstallerPath `
-  -LinkLibraries @("Newdev.lib", "Setupapi.lib")
 Build-NativeDll `
   -SourcePath $SetupActionsSource `
   -OutputPath $SetupActionsPath
-
-Invoke-WixBuild `
-  -Arguments @(
-  (Join-Path $WixDir "DriverUsb.wxs"),
-  "-arch", $Arch,
-  "-d", "VdsVersion=$ResolvedVersion",
-  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-  "-d", "RootDeviceInstaller=$RootDeviceInstallerPath",
-  "-out", $UsbMsiPath
-) `
-  -FailureMessage "wix USB driver MSI build failed"
-
-Invoke-WixBuild `
-  -Arguments @(
-  (Join-Path $WixDir "DriverFilter.wxs"),
-  "-arch", $Arch,
-  "-d", "VdsVersion=$ResolvedVersion",
-  "-d", "DriverPackageRoot=$ResolvedDriverPackageRoot",
-  "-d", "WindrvDir=$(Join-Path $RepoRoot "windrv")",
-  "-d", "DriverScriptRunner=$DriverScriptRunnerPath",
-  "-out", $FilterMsiPath
-) `
-  -FailureMessage "wix filter driver MSI build failed"
 
 Invoke-WixBuild `
   -Arguments @(
@@ -638,8 +544,6 @@ Invoke-WixBuild `
 New-SetupPayloadHeader `
   -OutputPath $SetupPayloadHeader `
   -MainMsiPath $MainMsiPath `
-  -UsbMsiPath $UsbMsiPath `
-  -FilterMsiPath $FilterMsiPath `
   -DisplayVersion $ResolvedDisplayVersion
 New-SetupLauncherManifest -OutputPath $SetupLauncherManifest
 Build-NativeLauncher `
