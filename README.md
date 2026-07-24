@@ -6,14 +6,15 @@ Virtual USB-to-Bluetooth bridge for DualSense and DualSense Edge Wireless
 Controllers. vDS currently supports all USB-based DualSense features over
 Bluetooth (except firmware update), including quadraphonic haptic feedback
 (vibration and speaker output), adaptive triggers, microphone input, and
-headphone output; microphone and headphone support was added thanks to
+headphone output. Microphone and headphone support and the Windows USB/IP
+integration were contributed by
 [@TechAntohere](https://github.com/TechAntohere).
 
-Through Linux `vds_hcd.ko` and Windows `vds_usb.sys` kernel drivers, vDS exposes
-a Bluetooth-connected controller as a virtual USB DualSense-class device so
-games and applications can use features normally available only over USB. The
-common userspace daemon `vdsd` translates the virtual USB traffic to and from
-the physical controller's Bluetooth protocol.
+On both Linux and Windows, `vdsd` communicates directly with the physical
+controller over Bluetooth HID and translates between its Bluetooth protocol and
+virtual USB traffic. Linux exposes the virtual DualSense-class device through
+`vds_hcd.ko`. Windows exports it through usbip-win2 and uses HidHide to conceal
+the physical controller from other applications.
 
 Detailed DualSense output and haptics packet handling is based on
 [DS5Dongle](https://github.com/awalol/DS5Dongle) and protocol capture research.
@@ -28,6 +29,9 @@ support physical transports other than Bluetooth.
 - [Windows](README-WINDOWS.md)
 
 ## Common Controller Configuration
+
+On both Linux and Windows, `vdsctl` is a control client. Every operation is sent
+through the daemon control interface and executed by `vdsd`.
 
 `vdsctl attach` registers paired physical Bluetooth controllers in `vdsd.db`.
 The same command format and JSONL database format are used on Linux and Windows.
@@ -56,8 +60,9 @@ Omit `--ports` or pass `--ports ""` to allow all configured ports. Omit
 {"address":"aa:bb:cc:dd:ee:02","profile":"dse","ports":[1]}
 ```
 
-`--ports 0,2` maps to `/dev/vds0,/dev/vds2` on Linux and `\\.\vds0,\\.\vds2` on
-Windows.
+With `--ports 0,2`, Linux reports `/dev/vds0` or `/dev/vds2` as the active
+device path. Windows reports the corresponding USB/IP endpoint,
+`usbip://127.0.0.1:3240/1-1` or `usbip://127.0.0.1:3240/1-3`.
 
 ## Reporting Issues
 

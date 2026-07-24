@@ -31,9 +31,6 @@ Application
   -(Bluetooth HID Control/Interrupt)-> DualSense (Edge) controller
 ```
 
-The future goal is to remove userspace from runtime communication where possible
-and reduce overhead.
-
 The virtual USB HID endpoint descriptors match each controller's USB HID
 specification: DualSense HID IN/OUT use 4 ms intervals, while DualSense Edge HID
 IN uses 1 ms and HID OUT uses 4 ms. vDS uses the HID IN interval to pace virtual
