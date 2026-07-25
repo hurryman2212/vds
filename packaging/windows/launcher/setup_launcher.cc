@@ -758,7 +758,8 @@ int run_main_msi(const std::filesystem::path &msi,
       quote_command_argument(system_executable(L"msiexec.exe").wstring());
   command_line += L" /i ";
   command_line += quote_command_argument(msi.wstring());
-  command_line += L" ADDLOCAL=MainFeature VDS_SETUP_LAUNCHED=1 "
+  command_line += L" ADDLOCAL=MainFeature REINSTALLMODE=amus "
+                  L"VDS_SETUP_LAUNCHED=1 "
                   L"VDS_SETUP_SOURCE=";
   command_line += quote_command_argument(setup_source.wstring());
   command_line += L" /norestart";
