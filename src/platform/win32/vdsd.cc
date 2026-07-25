@@ -135,8 +135,8 @@ using vds::win::UniqueHandle;
 using vds::win::win32_error_message;
 
 struct Options {
-  std::string db_path = vds::kDefaultDbPath;
-  std::string log_path = vds::kDefaultLogPath;
+  std::string db_path;
+  std::string log_path;
   std::string pipe = kDefaultControlPipe;
 };
 

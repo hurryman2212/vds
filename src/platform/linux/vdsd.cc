@@ -109,8 +109,8 @@ volatile sig_atomic_t g_log_reopen_requested = 0;
 
 struct Options {
   std::string socket = kDefaultControlSocket;
-  std::string log_path = vds::kDefaultLogPath;
-  std::string db_path = vds::kDefaultDbPath;
+  std::string log_path;
+  std::string db_path;
 };
 
 struct LatencyTraceStats {

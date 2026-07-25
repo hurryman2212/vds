@@ -82,5 +82,5 @@ You can check or attach the `vdsd` log from:
 
 ```text
 Linux:   /var/log/vdsd.log
-Windows: C:\ProgramData\vDS\vdsd.log
+Windows: %ProgramData%\vDS\vdsd.log
 ```

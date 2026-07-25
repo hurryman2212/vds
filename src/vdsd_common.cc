@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
 
 #include <algorithm>
+#include <filesystem>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -9,23 +10,61 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "jsonl.hh"
-#include "vds_config.hh"
 #include "vds_log.hh"
 #include "vdsd_common.hh"
 
 namespace vds {
 
+namespace {
+
+#ifdef _WIN32
+std::string windows_program_data_file(std::string_view filename) {
+  const DWORD required = GetEnvironmentVariableA("ProgramData", nullptr, 0);
+  if (required == 0) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+
+  std::string program_data(required, '\0');
+  const DWORD length =
+      GetEnvironmentVariableA("ProgramData", program_data.data(), required);
+  if (length == 0 || length >= required) {
+    throw std::runtime_error("ProgramData is not available");
+  }
+  program_data.resize(length);
+
+  return (std::filesystem::path(program_data) / "vDS" / filename).string();
+}
+#endif
+
+} // namespace
+
 VdsdCommonOptions default_vdsd_common_options() {
+#ifdef _WIN32
   return VdsdCommonOptions{
-      .db_path = kDefaultDbPath,
-      .log_path = kDefaultLogPath,
+      .db_path = windows_program_data_file("vdsd.db"),
+      .log_path = windows_program_data_file("vdsd.log"),
       .help_requested = false,
   };
+#else
+  return VdsdCommonOptions{
+      .db_path = "/var/lib/vds/vdsd.db",
+      .log_path = "/var/log/vdsd.log",
+      .help_requested = false,
+  };
+#endif
 }
 
 std::string vdsd_usage(std::string_view version, std::string_view build_year,
                        std::string_view platform_options) {
+  const VdsdCommonOptions defaults = default_vdsd_common_options();
   std::string text = "vdsd (";
   text += version;
   text += "): vDS daemon - Copyright (C) ";
@@ -33,9 +72,9 @@ std::string vdsd_usage(std::string_view version, std::string_view build_year,
   text += " Jihong Min\n"
           "usage:\n"
           "  vdsd [--db-path ";
-  text += kDefaultDbPath;
+  text += defaults.db_path;
   text += "] [--log ";
-  text += kDefaultLogPath;
+  text += defaults.log_path;
   text += "]";
   if (!platform_options.empty()) {
     text += " ";

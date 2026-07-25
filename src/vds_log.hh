@@ -9,12 +9,6 @@
 
 namespace vds {
 
-#ifdef _WIN32
-inline constexpr const char *kDefaultLogPath = R"(C:\ProgramData\vDS\vdsd.log)";
-#else
-inline constexpr const char *kDefaultLogPath = "/var/log/vdsd.log";
-#endif
-
 enum class LogLevel {
   Debug,
   Info,

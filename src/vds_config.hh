@@ -13,12 +13,6 @@
 
 namespace vds {
 
-#ifdef _WIN32
-inline constexpr const char *kDefaultDbPath = R"(C:\ProgramData\vDS\vdsd.db)";
-#else
-inline constexpr const char *kDefaultDbPath = "/var/lib/vds/vdsd.db";
-#endif
-
 inline constexpr unsigned kMinPortCount = VDS_MIN_PORT_COUNT;
 inline constexpr unsigned kMaxPortCount = VDS_MAX_PORT_COUNT;
 
