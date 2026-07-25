@@ -377,9 +377,9 @@ struct BridgeState {
   bool audio_stream_had_pcm = false;
   bool headset_plugged = false;
   bool headset_mic_plugged = false;
-  bool speaker_waveout_selected = true;
-  bool speaker_waveout_active = false;
-  std::uint32_t speaker_waveout_phase = 0;
+  bool waveout_speaker_selected = true;
+  bool waveout_active = false;
+  std::uint32_t waveout_phase = 0;
   bool audio_queue_empty_reported = false;
   bool audio_underflow_reported = false;
 };
@@ -763,10 +763,10 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
         std::lock_guard guard(state.mutex);
         const bool active = event.altsetting != 0;
         if (active) {
-          state.speaker_waveout_active = false;
+          state.waveout_active = false;
         }
         state.output_state.set_audio_out_stream_active(
-            active || state.speaker_waveout_active, state.headset_plugged);
+            active || state.waveout_active, state.headset_plugged);
         state.audio_out_stream_active = active;
         state.audio_pcm_stream_active = false;
         state.audio_stream_had_pcm = false;
@@ -862,10 +862,10 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
     {
       std::lock_guard guard(state.mutex);
       applied = state.output_state.apply_usb_output_report(frame.payload);
-      if (applied &&
-          (state.audio_out_stream_active || state.speaker_waveout_active)) {
-        state.output_state.set_audio_out_stream_active(true,
-                                                       state.headset_plugged);
+      if (applied && (state.audio_out_stream_active || state.waveout_active)) {
+        state.output_state.set_audio_out_stream_active(
+            true, state.waveout_active ? !state.waveout_speaker_selected
+                                       : state.headset_plugged);
       }
     }
     std::string message =
@@ -964,41 +964,39 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
           std::lock_guard guard(state.mutex);
           if (command_device == kTestCommandAudioDevice &&
               command_action == kTestCommandWaveoutPrepare) {
-            state.speaker_waveout_selected =
+            state.waveout_speaker_selected =
                 frame.payload.size() > command_data_offset + 2 &&
                 frame.payload[command_data_offset + 2] ==
                     kTestCommandSpeakerParam;
             waveout_message =
                 std::string("WebHID waveout target=") +
-                (state.speaker_waveout_selected ? "speaker" : "headphone");
+                (state.waveout_speaker_selected ? "speaker" : "headphone");
           } else if (command_device == kTestCommandAudioDevice &&
                      command_action == kTestCommandWaveoutControl &&
                      frame.payload.size() > command_data_offset) {
             const bool enable = frame.payload[command_data_offset] != 0;
-            const bool speaker_waveout =
-                enable && state.speaker_waveout_selected;
-            state.speaker_waveout_active = speaker_waveout;
-            state.speaker_waveout_phase = 0;
+            state.waveout_active = enable;
+            state.waveout_phase = 0;
             state.waveout_extractor =
                 vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
             state.output_state.set_audio_out_stream_active(
-                speaker_waveout, state.headset_plugged);
-            state.audio_out_stream_active = speaker_waveout;
-            state.audio_pcm_stream_active = speaker_waveout;
-            state.audio_jitter_buffering = speaker_waveout;
+                enable, !state.waveout_speaker_selected);
+            state.audio_out_stream_active = enable;
+            state.audio_pcm_stream_active = enable;
+            state.audio_jitter_buffering = enable;
             state.audio_queue_empty_since = {};
             state.audio_queue_drained_time = {};
             state.have_last_audio_send_time = false;
             state.last_audio_chunk.reset();
-            if (!speaker_waveout) {
+            if (!enable) {
               state.pending_audio_chunks.clear();
             }
             update_bt_state = true;
             waveout_message =
                 std::string("WebHID waveout ") + (enable ? "on" : "off") +
                 " target=" +
-                (state.speaker_waveout_selected ? "speaker" : "headphone") +
-                " synthesized=" + (speaker_waveout ? "yes" : "no");
+                (state.waveout_speaker_selected ? "speaker" : "headphone") +
+                " synthesized=" + (enable ? "yes" : "no");
           }
         }
         if (!waveout_message.empty()) {
@@ -1056,9 +1054,9 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
   {
     std::lock_guard guard(state.mutex);
     const bool reset_audio_route =
-        !state.audio_out_stream_active || state.speaker_waveout_active;
+        !state.audio_out_stream_active || state.waveout_active;
     if (reset_audio_route) {
-      state.speaker_waveout_active = false;
+      state.waveout_active = false;
       state.output_state.set_audio_out_stream_active(true,
                                                      state.headset_plugged);
       state.audio_out_stream_active = true;
@@ -1341,9 +1339,10 @@ void handle_bluetooth_frame(HANDLE virtual_device,
         if (headset_plugged != state.headset_plugged) {
           state.headset_plugged = headset_plugged;
           headset_changed = true;
-          if (state.audio_out_stream_active || state.speaker_waveout_active) {
+          if (state.audio_out_stream_active || state.waveout_active) {
             state.output_state.set_audio_out_stream_active(
-                true, state.headset_plugged);
+                true, state.waveout_active ? !state.waveout_speaker_selected
+                                           : state.headset_plugged);
             output_state_changed = true;
           }
         }
@@ -1465,9 +1464,9 @@ void send_initial_bluetooth_reports(BluetoothTransport &bluetooth,
              "startup mic stream inactive until USB capture opens");
 }
 
-void enqueue_speaker_waveout_chunk(BridgeState &state) {
+void enqueue_waveout_chunk(BridgeState &state) {
   std::lock_guard guard(state.mutex);
-  if (!state.speaker_waveout_active || !state.pending_audio_chunks.empty()) {
+  if (!state.waveout_active || !state.pending_audio_chunks.empty()) {
     return;
   }
 
@@ -1476,12 +1475,12 @@ void enqueue_speaker_waveout_chunk(BridgeState &state) {
       pcm{};
   for (std::size_t frame = 0; frame < kWindowsPcmWindowFrames; ++frame) {
     const double angle = kSpeakerWaveoutTwoPi *
-                         static_cast<double>(state.speaker_waveout_phase) /
+                         static_cast<double>(state.waveout_phase) /
                          static_cast<double>(kSpeakerWaveoutPeriodFrames);
     const auto sample = static_cast<std::int16_t>(
         std::sin(angle) * static_cast<double>(kSpeakerWaveoutAmplitude));
-    state.speaker_waveout_phase =
-        (state.speaker_waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
+    state.waveout_phase =
+        (state.waveout_phase + 1) % kSpeakerWaveoutPeriodFrames;
 
     for (std::size_t channel = 0; channel < vds::kSpeakerChannels; ++channel) {
       const std::size_t offset =
@@ -1565,7 +1564,8 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
         has_signal = chunk.has_signal;
         packet = state.haptics_builder.build_packet(
             chunk.haptics, chunk.speaker, state.output_state.state(), true,
-            state.headset_plugged);
+            state.waveout_active ? !state.waveout_speaker_selected
+                                 : state.headset_plugged);
         sending_concealment = true;
         scheduled_send_time =
             state.next_haptics_send_time == Clock::time_point{}
@@ -1612,7 +1612,7 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
           }
         }
         state.audio_pcm_stream_active = false;
-        if (!state.speaker_waveout_active) {
+        if (!state.waveout_active) {
           state.output_state.set_audio_out_stream_active(false,
                                                          state.headset_plugged);
           state.audio_out_stream_active = false;
@@ -1671,7 +1671,9 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
         haptics_limited = haptics_limited || limited != sample;
         sample = limited;
       }
-      const bool route_headset = state.headset_plugged;
+      const bool route_headset = state.waveout_active
+                                     ? !state.waveout_speaker_selected
+                                     : state.headset_plugged;
       packet = state.haptics_builder.build_packet(haptics, chunk.speaker,
                                                   state.output_state.state(),
                                                   true, route_headset);
@@ -1998,7 +2000,7 @@ void audio_flush_loop(BluetoothTransport &bluetooth, BridgeState &state,
       }
       state.audio_last_flush_time = now;
     }
-    enqueue_speaker_waveout_chunk(state);
+    enqueue_waveout_chunk(state);
     const auto sleep_duration =
         flush_pending_audio_chunk(bluetooth, state, logger, bluetooth_mutex);
     maybe_log_audio_summary(bluetooth, state, logger);
