@@ -72,6 +72,13 @@ std::string utf8_from_utf16(std::wstring_view text) {
   return converted;
 }
 
+void lowercase_ascii(std::string &text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+}
+
 std::wstring environment_value(const wchar_t *name) {
   const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
   if (required == 0) {
@@ -176,16 +183,31 @@ std::string run_cli(std::initializer_list<std::wstring> arguments) {
                              win32_error_message(GetLastError()));
   }
 
+  HANDLE input_read_handle = nullptr;
+  HANDLE input_write_handle = nullptr;
+  if (!CreatePipe(&input_read_handle, &input_write_handle, &security_attributes,
+                  0)) {
+    throw std::runtime_error("failed to create HidHideCLI input pipe: " +
+                             win32_error_message(GetLastError()));
+  }
+  UniqueHandle input_read(input_read_handle);
+  UniqueHandle input_write(input_write_handle);
+  input_write.reset();
+
   std::wstring command_line = quote_argument(cli_path);
   for (const std::wstring &argument : arguments) {
     command_line.push_back(L' ');
-    command_line += quote_argument(argument);
+    if (argument.rfind(L"--", 0) == 0) {
+      command_line += argument;
+    } else {
+      command_line += quote_argument(argument);
+    }
   }
 
   STARTUPINFOW startup_info{};
   startup_info.cb = sizeof(startup_info);
   startup_info.dwFlags = STARTF_USESTDHANDLES;
-  startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startup_info.hStdInput = input_read.get();
   startup_info.hStdOutput = output_write.get();
   startup_info.hStdError = output_write.get();
   PROCESS_INFORMATION process_info{};
@@ -198,6 +220,7 @@ std::string run_cli(std::initializer_list<std::wstring> arguments) {
 
   UniqueHandle process(process_info.hProcess);
   UniqueHandle thread(process_info.hThread);
+  input_read.reset();
   output_write.reset();
 
   std::string output;
@@ -254,14 +277,8 @@ std::string run_cli(std::initializer_list<std::wstring> arguments) {
 bool device_is_hidden(std::string_view instance_path) {
   std::string output = run_cli({L"--dev-list"});
   std::string needle = "--dev-hide \"" + std::string(instance_path) + "\"";
-  std::transform(output.begin(), output.end(), output.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
-  std::transform(needle.begin(), needle.end(), needle.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
+  lowercase_ascii(output);
+  lowercase_ascii(needle);
   return output.find(needle) != std::string::npos;
 }
 
@@ -277,7 +294,18 @@ std::string provider_path() {
   return path.empty() ? std::string{} : utf8_from_utf16(path);
 }
 
-void register_daemon() { run_cli({L"--app-reg", executable_path()}); }
+void register_daemon() {
+  const std::wstring path = executable_path();
+  run_cli({L"--app-reg", path});
+
+  std::string output = run_cli({L"--app-list"});
+  std::string needle = "--app-reg \"" + utf8_from_utf16(path) + "\"";
+  lowercase_ascii(output);
+  lowercase_ascii(needle);
+  if (output.find(needle) == std::string::npos) {
+    throw std::runtime_error("HidHide did not register the vdsd executable");
+  }
+}
 
 DeviceGuard::DeviceGuard(std::string instance_path, Logger &logger)
     : instance_path_(std::move(instance_path)), logger_(logger) {

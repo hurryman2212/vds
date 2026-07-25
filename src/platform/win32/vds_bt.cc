@@ -928,6 +928,30 @@ extract_bluetooth_address_from_devinst(DEVINST devinst) {
     if (CM_Get_Device_IDA(current, id.data(), static_cast<ULONG>(id.size()),
                           0) == CR_SUCCESS) {
       const std::string lower_id = lowercase_ascii(id.data());
+      if (lower_id.rfind(R"(bthenum\)", 0) == 0) {
+        const std::size_t instance_separator =
+            lower_id.find('\\', std::string_view(R"(bthenum\)").size());
+        if (instance_separator != std::string::npos) {
+          const std::string_view instance(
+              lower_id.data() + instance_separator + 1,
+              lower_id.size() - instance_separator - 1);
+          constexpr std::string_view marker = "&0&";
+          const std::size_t marker_pos = instance.rfind(marker);
+          if (marker_pos != std::string_view::npos) {
+            const std::size_t address_pos = marker_pos + marker.size();
+            const std::size_t address_end = address_pos + 12;
+            if (address_end + 2 <= instance.size() &&
+                instance.substr(address_end, 2) == "_c") {
+              const std::string candidate(
+                  instance.substr(address_pos, address_end - address_pos));
+              if (is_compact_bluetooth_address(candidate)) {
+                return candidate;
+              }
+            }
+          }
+        }
+      }
+
       for (const std::string_view marker : markers) {
         std::size_t marker_pos = lower_id.find(marker);
         while (marker_pos != std::string::npos) {

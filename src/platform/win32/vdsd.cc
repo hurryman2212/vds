@@ -2944,38 +2944,57 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
     }
 
     vds::Logger logger(options.log_path);
-    TimerResolutionGuard timer_resolution(kWindowsTimerResolutionMs);
-    logger.log(vds::LogScope::Output,
-               timer_resolution.active() ? vds::LogLevel::Info
-                                         : vds::LogLevel::Warn,
-               std::string("Windows timer resolution 1 ms ") +
-                   (timer_resolution.active() ? "enabled" : "request failed"));
-    if (!virtual_port_provider_available()) {
-      logger.log(vds::LogScope::Port, vds::LogLevel::Error,
-                 std::string(kVirtualPortProviderUnavailableReason) +
-                     " detail=" + kWindowsVirtualPortProviderUnavailable);
-      throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
-    }
-    if (!vds::win::hidhide::provider_available()) {
-      logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
-                 std::string(kVirtualPortProviderUnavailableReason) +
-                     " detail=" + kWindowsHidHideProviderUnavailable);
-      throw std::runtime_error(kWindowsHidHideProviderUnavailable);
-    }
-    vds::win::hidhide::register_daemon();
-    if (service_mode) {
-      update_service_status(SERVICE_RUNNING);
-      logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-                 "Windows service started");
-    }
+    try {
+      TimerResolutionGuard timer_resolution(kWindowsTimerResolutionMs);
+      logger.log(
+          vds::LogScope::Output,
+          timer_resolution.active() ? vds::LogLevel::Info : vds::LogLevel::Warn,
+          std::string("Windows timer resolution 1 ms ") +
+              (timer_resolution.active() ? "enabled" : "request failed"));
+      if (!virtual_port_provider_available()) {
+        logger.log(vds::LogScope::Port, vds::LogLevel::Error,
+                   std::string(kVirtualPortProviderUnavailableReason) +
+                       " detail=" + kWindowsVirtualPortProviderUnavailable);
+        throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
+      }
+      if (!vds::win::hidhide::provider_available()) {
+        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
+                   std::string(kVirtualPortProviderUnavailableReason) +
+                       " detail=" + kWindowsHidHideProviderUnavailable);
+        throw std::runtime_error(kWindowsHidHideProviderUnavailable);
+      }
+      vds::win::hidhide::register_daemon();
+      if (service_mode) {
+        update_service_status(SERVICE_RUNNING);
+        logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                   "Windows service started");
+      }
 
-    run_bridge_supervisor(options, logger);
-    g_stop_event = nullptr;
-    logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-               "Windows bridge stopped");
-    return 0;
+      run_bridge_supervisor(options, logger);
+      g_stop_event = nullptr;
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                 "Windows bridge stopped");
+      return 0;
+    } catch (const std::exception &error) {
+      try {
+        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                   std::string("Windows daemon failed: ") + error.what());
+      } catch (...) {
+      }
+      throw;
+    } catch (...) {
+      try {
+        logger.log(vds::LogScope::Daemon, vds::LogLevel::Error,
+                   "Windows daemon failed with an unknown error");
+      } catch (...) {
+      }
+      throw;
+    }
   } catch (const std::exception &error) {
     std::cerr << "error: " << error.what() << "\n";
+    return 1;
+  } catch (...) {
+    std::cerr << "error: unknown Windows daemon failure\n";
     return 1;
   }
 }
