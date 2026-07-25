@@ -429,6 +429,7 @@ function Build-NativeLauncher {
     $SourcePath,
     "/link",
     "Advapi32.lib",
+    "Comctl32.lib",
     "Shell32.lib",
     "User32.lib"
   )

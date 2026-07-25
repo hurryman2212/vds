@@ -12,6 +12,7 @@
 
 #include <windows.h>
 
+#include "setup_paths.hh"
 #include "uninstall_payload.hh"
 
 namespace {
@@ -166,15 +167,8 @@ bool service_exists(const wchar_t *name) {
 }
 
 std::filesystem::path uninstall_root() {
-  std::vector<wchar_t> temp_path(MAX_PATH + 1);
-  const DWORD length =
-      GetTempPathW(static_cast<DWORD>(temp_path.size()), temp_path.data());
-  if (length == 0 || length >= temp_path.size()) {
-    throw std::runtime_error("GetTempPathW failed");
-  }
-
-  std::filesystem::path root(temp_path.data());
-  root /= L"vds-uninstall-" + std::to_wstring(GetCurrentProcessId());
+  std::filesystem::path root = vds::setup::secure_system_temp_root();
+  root /= L"uninstall-" + std::to_wstring(GetCurrentProcessId());
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   return root;

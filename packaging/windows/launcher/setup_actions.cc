@@ -11,6 +11,8 @@
 
 #include <msiquery.h>
 
+#include "setup_paths.hh"
+
 namespace {
 
 std::wstring quote_command_argument(std::wstring_view value) {
@@ -163,18 +165,6 @@ std::wstring msi_property(MSIHANDLE install, const wchar_t *name) {
   return value;
 }
 
-std::filesystem::path program_data_path() {
-  std::vector<wchar_t> program_data(MAX_PATH + 1);
-  const DWORD length =
-      GetEnvironmentVariableW(L"ProgramData", program_data.data(),
-                              static_cast<DWORD>(program_data.size()));
-  if (length == 0 || length >= program_data.size()) {
-    throw std::runtime_error("ProgramData is not available");
-  }
-
-  return std::filesystem::path(program_data.data());
-}
-
 std::filesystem::path program_files_path() {
   std::vector<wchar_t> program_files(MAX_PATH + 1);
   DWORD length =
@@ -189,34 +179,6 @@ std::filesystem::path program_files_path() {
   }
 
   return std::filesystem::path(program_files.data());
-}
-
-std::filesystem::path temp_path() {
-  std::vector<wchar_t> temp_path(MAX_PATH + 1);
-  const DWORD length =
-      GetTempPathW(static_cast<DWORD>(temp_path.size()), temp_path.data());
-  if (length == 0 || length >= temp_path.size()) {
-    throw std::runtime_error("GetTempPathW failed");
-  }
-
-  return std::filesystem::path(temp_path.data());
-}
-
-std::filesystem::path installer_cache_dir() {
-  std::filesystem::path path = temp_path();
-  path /= L"vDSSetup";
-  return path;
-}
-
-std::filesystem::path installer_cache_path() {
-  std::filesystem::path path = installer_cache_dir();
-  path /= L"vDSSetup.exe";
-  return path;
-}
-
-std::filesystem::path prepare_installer_cache_path() {
-  std::filesystem::create_directories(installer_cache_dir());
-  return installer_cache_path();
 }
 
 void delete_hklm_vds_setup_value(const wchar_t *name) {
@@ -248,7 +210,9 @@ std::wstring cache_setup_launcher(MSIHANDLE install) {
     return {};
   }
 
-  const std::filesystem::path cached_installer = prepare_installer_cache_path();
+  const std::filesystem::path cached_installer =
+      vds::setup::persistent_launcher_path();
+  std::filesystem::create_directories(cached_installer.parent_path());
   std::filesystem::copy_file(source, cached_installer,
                              std::filesystem::copy_options::overwrite_existing);
   return cached_installer.wstring();
@@ -395,8 +359,16 @@ void remove_userspace_files(const std::filesystem::path &path) {
 
 extern "C" __declspec(dllexport) UINT __stdcall
 UpdateDisplayVersion(MSIHANDLE install) {
-  const std::wstring cached_installer = cache_setup_launcher(install);
-  update_control_panel_entry(install, cached_installer);
+  try {
+    const std::wstring cached_installer = cache_setup_launcher(install);
+    update_control_panel_entry(install, cached_installer);
+  } catch (const std::exception &error) {
+    std::wstring message = L"failed to cache the vDS setup launcher: ";
+    message += wide_from_log_bytes(error.what());
+    append_installer_log(message);
+  } catch (...) {
+    append_installer_log(L"failed to cache the vDS setup launcher");
+  }
   return ERROR_SUCCESS;
 }
 
@@ -413,7 +385,7 @@ RequestProgramDataRemoval(MSIHANDLE install) {
 
   try {
     const std::filesystem::path marker =
-        program_data_path() / L"vDS.remove-program-data";
+        vds::setup::program_data_directory() / L"vDS.remove-program-data";
     std::ofstream stream(marker, std::ios::binary | std::ios::trunc);
     if (!stream) {
       append_installer_log(

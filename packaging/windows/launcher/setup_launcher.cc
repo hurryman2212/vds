@@ -11,6 +11,9 @@
 
 #include <windows.h>
 
+#include <commctrl.h>
+
+#include "setup_paths.hh"
 #include "setup_payload.hh"
 
 namespace {
@@ -80,20 +83,8 @@ std::filesystem::path current_executable_path() {
   }
 }
 
-std::filesystem::path program_data_path() {
-  std::vector<wchar_t> program_data(32768);
-  const DWORD length =
-      GetEnvironmentVariableW(L"ProgramData", program_data.data(),
-                              static_cast<DWORD>(program_data.size()));
-  if (length == 0 || length >= static_cast<DWORD>(program_data.size())) {
-    throw std::runtime_error("ProgramData is not available");
-  }
-
-  return std::filesystem::path(program_data.data());
-}
-
 std::filesystem::path installer_log_path() {
-  std::filesystem::path path = program_data_path();
+  std::filesystem::path path = vds::setup::program_data_directory();
   path /= L"vDS";
   std::filesystem::create_directories(path);
   path /= L"installer.log";
@@ -142,6 +133,19 @@ void append_installer_log(std::wstring_view message) noexcept {
   }
 }
 
+std::wstring wide_from_ascii(std::string_view text) {
+  std::wstring result;
+  result.reserve(text.size());
+  for (const unsigned char ch : text) {
+    if (ch >= 0x20 && ch < 0x7f) {
+      result.push_back(static_cast<wchar_t>(ch));
+    } else {
+      result.push_back(L'?');
+    }
+  }
+  return result;
+}
+
 bool process_is_elevated() {
   HANDLE token = nullptr;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
@@ -158,6 +162,11 @@ bool process_is_elevated() {
 
 void configure_process_ui() {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+  INITCOMMONCONTROLSEX controls{};
+  controls.dwSize = sizeof(controls);
+  controls.dwICC = ICC_PROGRESS_CLASS;
+  InitCommonControlsEx(&controls);
 }
 
 int relaunch_elevated(bool uninstall) {
@@ -189,15 +198,7 @@ int relaunch_elevated(bool uninstall) {
 }
 
 std::filesystem::path setup_work_dir() {
-  std::vector<wchar_t> temp_path(MAX_PATH + 1);
-  const DWORD length =
-      GetTempPathW(static_cast<DWORD>(temp_path.size()), temp_path.data());
-  if (length == 0 || length >= temp_path.size()) {
-    throw std::runtime_error("GetTempPathW failed");
-  }
-
-  std::filesystem::path path(temp_path.data());
-  path /= L"vDSSetup";
+  std::filesystem::path path = vds::setup::secure_system_temp_root();
   path /= L"payload-" + std::to_wstring(GetCurrentProcessId());
   std::filesystem::remove_all(path);
   std::filesystem::create_directories(path);
@@ -219,7 +220,158 @@ void write_payloads(const std::filesystem::path &dir) {
   }
 }
 
-int run_process(std::wstring command_line, int show_window) {
+struct DependencyProgressState {
+  HANDLE process = nullptr;
+  std::filesystem::path progress_path;
+  std::string displayed_record;
+  bool process_complete = false;
+  bool cancel_allowed = false;
+  bool marquee = false;
+};
+
+bool read_dependency_progress(const std::filesystem::path &path,
+                              int &percent_complete, std::wstring &message,
+                              std::string &record) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    return false;
+  }
+
+  std::getline(stream, record, '\0');
+  const std::size_t separator = record.find('\t');
+  if (separator == std::string::npos || separator == 0 ||
+      separator + 1 >= record.size()) {
+    return false;
+  }
+
+  int parsed_percent = -1;
+  if (record.substr(0, separator) != "-1") {
+    parsed_percent = 0;
+    for (std::size_t index = 0; index < separator; ++index) {
+      const char ch = record[index];
+      if (ch < '0' || ch > '9') {
+        return false;
+      }
+      parsed_percent = parsed_percent * 10 + ch - '0';
+      if (parsed_percent > 100) {
+        return false;
+      }
+    }
+  }
+
+  percent_complete = parsed_percent;
+  message = wide_from_ascii(
+      std::string_view(record).substr(separator + 1, record.size()));
+  return true;
+}
+
+HRESULT CALLBACK dependency_progress_callback(HWND window, UINT notification,
+                                              WPARAM parameter, LPARAM,
+                                              LONG_PTR callback_data) {
+  auto &state = *reinterpret_cast<DependencyProgressState *>(callback_data);
+
+  if (notification == TDN_CREATED) {
+    SendMessageW(window, TDM_SET_PROGRESS_BAR_RANGE, 0, MAKELPARAM(0, 100));
+    SendMessageW(window, TDM_SET_PROGRESS_BAR_POS, 0, 0);
+    if (!state.cancel_allowed) {
+      EnableWindow(GetDlgItem(window, IDCANCEL), FALSE);
+    }
+    return S_OK;
+  }
+
+  if (notification == TDN_TIMER) {
+    int percent_complete = 0;
+    std::wstring message;
+    std::string record;
+    if (read_dependency_progress(state.progress_path, percent_complete, message,
+                                 record) &&
+        record != state.displayed_record) {
+      if (percent_complete < 0) {
+        if (!state.marquee) {
+          SendMessageW(window, TDM_SET_MARQUEE_PROGRESS_BAR, TRUE, 0);
+          // Keep the indeterminate animation responsive on slow installs.
+          SendMessageW(window, TDM_SET_PROGRESS_BAR_MARQUEE, TRUE, 30);
+          state.marquee = true;
+        }
+      } else {
+        if (state.marquee) {
+          SendMessageW(window, TDM_SET_PROGRESS_BAR_MARQUEE, FALSE, 0);
+          SendMessageW(window, TDM_SET_MARQUEE_PROGRESS_BAR, FALSE, 0);
+          SendMessageW(window, TDM_SET_PROGRESS_BAR_RANGE, 0,
+                       MAKELPARAM(0, 100));
+          state.marquee = false;
+        }
+        SendMessageW(window, TDM_SET_PROGRESS_BAR_POS,
+                     static_cast<WPARAM>(percent_complete), 0);
+      }
+      SendMessageW(window, TDM_SET_ELEMENT_TEXT, TDE_CONTENT,
+                   reinterpret_cast<LPARAM>(message.c_str()));
+      state.displayed_record = std::move(record);
+    }
+
+    if (WaitForSingleObject(state.process, 0) == WAIT_OBJECT_0) {
+      state.process_complete = true;
+      EnableWindow(GetDlgItem(window, IDCANCEL), TRUE);
+      PostMessageW(window, TDM_CLICK_BUTTON, IDCANCEL, 0);
+    }
+    return S_OK;
+  }
+
+  if (notification == TDN_BUTTON_CLICKED && parameter == IDCANCEL &&
+      !state.process_complete) {
+    if (!state.cancel_allowed) {
+      return S_FALSE;
+    }
+    if (!TerminateProcess(state.process, ERROR_CANCELLED)) {
+      append_installer_log(L"failed to cancel dependency download");
+      return S_FALSE;
+    }
+    WaitForSingleObject(state.process, INFINITE);
+    state.process_complete = true;
+  }
+  return S_OK;
+}
+
+void show_dependency_progress(HANDLE process,
+                              const std::filesystem::path &progress_path,
+                              const wchar_t *instruction, bool cancel_allowed) {
+  DependencyProgressState state{};
+  state.process = process;
+  state.progress_path = progress_path;
+  state.cancel_allowed = cancel_allowed;
+
+  TASKDIALOGCONFIG dialog{};
+  dialog.cbSize = sizeof(dialog);
+  dialog.dwFlags = TDF_CALLBACK_TIMER | TDF_SHOW_PROGRESS_BAR;
+  if (cancel_allowed) {
+    dialog.dwFlags |= TDF_ALLOW_DIALOG_CANCELLATION;
+  }
+  dialog.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+  dialog.pszWindowTitle = L"vDS Setup";
+  dialog.pszMainInstruction = instruction;
+  dialog.pszContent = L"Preparing USB/IP and HidHide...";
+  dialog.pfCallback = dependency_progress_callback;
+  dialog.lpCallbackData = reinterpret_cast<LONG_PTR>(&state);
+  dialog.cxWidth = 320;
+
+  int selected_button = 0;
+  const HRESULT result =
+      TaskDialogIndirect(&dialog, &selected_button, nullptr, nullptr);
+  if (FAILED(result)) {
+    std::wstring message = L"TaskDialogIndirect failed: ";
+    message += std::to_wstring(static_cast<unsigned long>(result));
+    append_installer_log(message);
+  }
+
+  if (!state.process_complete) {
+    WaitForSingleObject(process, INFINITE);
+  }
+}
+
+int run_process(std::wstring command_line, int show_window,
+                const std::filesystem::path &progress_path = {},
+                const wchar_t *progress_instruction = nullptr,
+                bool progress_cancel_allowed = false) {
   {
     std::wstring message = L"run: ";
     message += command_line;
@@ -240,7 +392,12 @@ int run_process(std::wstring command_line, int show_window) {
     return 1;
   }
 
-  WaitForSingleObject(process_info.hProcess, INFINITE);
+  if (progress_path.empty()) {
+    WaitForSingleObject(process_info.hProcess, INFINITE);
+  } else {
+    show_dependency_progress(process_info.hProcess, progress_path,
+                             progress_instruction, progress_cancel_allowed);
+  }
   DWORD exit_code = 1;
   if (!GetExitCodeProcess(process_info.hProcess, &exit_code)) {
     exit_code = 1;
@@ -291,7 +448,23 @@ int run_dependency_script(const std::filesystem::path &script,
   command_line += quote_command_argument(download_dir.wstring());
   command_line += L" -LogPath ";
   command_line += quote_command_argument(installer_log_path().wstring());
-  return run_process(std::move(command_line), SW_HIDE);
+
+  if (mode == L"Check") {
+    return run_process(std::move(command_line), SW_HIDE);
+  }
+
+  const std::filesystem::path progress_path =
+      download_dir.parent_path() / L"dependency-progress.txt";
+  std::error_code ignored;
+  std::filesystem::remove(progress_path, ignored);
+  command_line += L" -ProgressPath ";
+  command_line += quote_command_argument(progress_path.wstring());
+
+  const bool download = mode == L"Download";
+  return run_process(std::move(command_line), SW_HIDE, progress_path,
+                     download ? L"Downloading required components"
+                              : L"Installing required components",
+                     download);
 }
 
 struct ServiceHandle {
@@ -327,19 +500,6 @@ void append_win32_error_log(std::wstring_view prefix, DWORD error) noexcept {
   message += L": ";
   message += std::to_wstring(error);
   append_installer_log(message);
-}
-
-std::wstring wide_from_ascii(std::string_view text) {
-  std::wstring result;
-  result.reserve(text.size());
-  for (const unsigned char ch : text) {
-    if (ch >= 0x20 && ch < 0x7f) {
-      result.push_back(static_cast<wchar_t>(ch));
-    } else {
-      result.push_back(L'?');
-    }
-  }
-  return result;
 }
 
 std::filesystem::path program_files_path() {
@@ -620,7 +780,33 @@ int run_main_msi_uninstall(const std::filesystem::path &msi,
   return run_process(std::move(command_line), SW_SHOWNORMAL);
 }
 
-void remove_setup_cache_after_exit() {
+void remove_directory_after_exit(const std::filesystem::path &directory) {
+  if (directory.empty()) {
+    return;
+  }
+
+  std::wstring command_line = quote_command_argument(
+      system_executable(L"WindowsPowerShell\\v1.0\\powershell.exe").wstring());
+  command_line += L" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                  L"-WindowStyle Hidden -Command ";
+
+  const std::wstring quoted_directory =
+      quote_powershell_single_quoted_string(directory.wstring());
+  std::wstring script = L"Start-Sleep -Seconds 2; "
+                        L"for ($i = 0; $i -lt 30; ++$i) { "
+                        L"Remove-Item -LiteralPath ";
+  script += quoted_directory;
+  script += L" -Recurse -Force -ErrorAction SilentlyContinue; "
+            L"if (!(Test-Path -LiteralPath ";
+  script += quoted_directory;
+  script += L")) { break }; "
+            L"Start-Sleep -Seconds 1 "
+            L"}";
+  command_line += quote_command_argument(script);
+  launch_process(std::move(command_line), SW_HIDE);
+}
+
+void remove_legacy_setup_cache_after_exit() {
   std::vector<wchar_t> temp_path(MAX_PATH + 1);
   const DWORD length =
       GetTempPathW(static_cast<DWORD>(temp_path.size()), temp_path.data());
@@ -628,28 +814,8 @@ void remove_setup_cache_after_exit() {
     return;
   }
 
-  std::filesystem::path cache_dir(temp_path.data());
-  cache_dir /= L"vDSSetup";
-
-  std::wstring command_line = quote_command_argument(
-      system_executable(L"WindowsPowerShell\\v1.0\\powershell.exe").wstring());
-  command_line += L" -NoProfile -NonInteractive -ExecutionPolicy Bypass "
-                  L"-WindowStyle Hidden -Command ";
-
-  const std::wstring quoted_cache_dir =
-      quote_powershell_single_quoted_string(cache_dir.wstring());
-  std::wstring script = L"Start-Sleep -Seconds 2; "
-                        L"for ($i = 0; $i -lt 30; ++$i) { "
-                        L"Remove-Item -LiteralPath ";
-  script += quoted_cache_dir;
-  script += L" -Recurse -Force -ErrorAction SilentlyContinue; "
-            L"if (!(Test-Path -LiteralPath ";
-  script += quoted_cache_dir;
-  script += L")) { break }; "
-            L"Start-Sleep -Seconds 1 "
-            L"}";
-  command_line += quote_command_argument(script);
-  launch_process(std::move(command_line), SW_HIDE);
+  remove_directory_after_exit(std::filesystem::path(temp_path.data()) /
+                              L"vDSSetup");
 }
 
 void show_failed_status(const wchar_t *stage, int status) {
@@ -684,7 +850,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::filesystem::path work_dir;
   try {
     const std::filesystem::path program_data_removal_marker =
-        program_data_path() / L"vDS.remove-program-data";
+        vds::setup::program_data_directory() / L"vDS.remove-program-data";
     if (uninstall) {
       std::error_code error;
       std::filesystem::remove(program_data_removal_marker, error);
@@ -716,33 +882,57 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         work_dir / L"install_dependencies.ps1";
     const std::filesystem::path dependency_download_dir =
         work_dir / L"dependencies";
+    bool dependencies_missing = false;
     if (!uninstall) {
-      const int response = MessageBoxW(
-          nullptr,
-          L"vDS requires USB/IP and HidHide.\n\n"
-          L"Setup will download the latest stable x64 installers from their "
-          L"official GitHub releases when either dependency is missing. Each "
-          L"download must have a valid Windows digital signature.\n\n"
-          L"The USB/IP project recommends creating a Windows system restore "
-          L"point before installation. Installing USB/IP also temporarily "
-          L"restarts USB 3 hubs. Connected USB devices may disconnect, so save "
-          L"any work that uses them before continuing.\n\n"
-          L"Already installed dependencies are left unchanged. Continue?",
-          L"vDS Setup", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
-      if (response != IDOK) {
+      const int check_status = run_dependency_script(
+          dependency_script, dependency_download_dir, L"Check");
+      // Exit code 10 is the private launcher/script contract for missing
+      // dependencies. All other nonzero values are actual check failures.
+      if (check_status == 10) {
+        dependencies_missing = true;
+      } else if (check_status != 0) {
+        show_failed_status(L"checking USB/IP and HidHide prerequisites",
+                           check_status);
         std::filesystem::remove_all(work_dir);
-        append_installer_log(L"dependency installation was canceled");
-        return ERROR_CANCELLED;
+        append_installer_log(L"dependency prerequisite check failed");
+        return check_status;
       }
 
-      const int download_status = run_dependency_script(
-          dependency_script, dependency_download_dir, L"Download");
-      if (!is_success_exit_code(download_status)) {
-        show_failed_status(L"downloading and verifying dependencies",
-                           download_status);
-        std::filesystem::remove_all(work_dir);
-        append_installer_log(L"dependency download failed");
-        return download_status;
+      if (dependencies_missing) {
+        const int response = MessageBoxW(
+            nullptr,
+            L"vDS requires USB/IP and HidHide.\n\n"
+            L"Setup will download the latest stable x64 installers from their "
+            L"official GitHub releases when either dependency is missing. Each "
+            L"download must have a valid Windows digital signature.\n\n"
+            L"The USB/IP project recommends creating a Windows system restore "
+            L"point before installation. Installing USB/IP also temporarily "
+            L"restarts USB 3 hubs. Connected USB devices may disconnect, so "
+            L"save any work that uses them before continuing.\n\n"
+            L"Already installed dependencies are left unchanged. Continue?",
+            L"vDS Setup", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (response != IDOK) {
+          std::filesystem::remove_all(work_dir);
+          append_installer_log(L"dependency installation was canceled");
+          return ERROR_CANCELLED;
+        }
+
+        const int download_status = run_dependency_script(
+            dependency_script, dependency_download_dir, L"Download");
+        if (!is_success_exit_code(download_status)) {
+          if (download_status != ERROR_CANCELLED) {
+            show_failed_status(L"downloading and verifying dependencies",
+                               download_status);
+          }
+          std::filesystem::remove_all(work_dir);
+          append_installer_log(download_status == ERROR_CANCELLED
+                                   ? L"dependency download was canceled"
+                                   : L"dependency download failed");
+          return download_status;
+        }
+      } else {
+        append_installer_log(
+            L"USB/IP and HidHide are already installed; skip dependency UI");
       }
     }
 
@@ -769,7 +959,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       }
 
       std::filesystem::remove_all(work_dir);
-      remove_setup_cache_after_exit();
       append_installer_log(L"vDS setup uninstall finished");
 
       if (remove_program_data) {
@@ -777,33 +966,40 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         std::error_code error;
         std::filesystem::remove(program_data_removal_marker, error);
         if (!error) {
-          std::filesystem::remove_all(program_data_path() / L"vDS", error);
+          remove_directory_after_exit(vds::setup::program_data_directory() /
+                                      L"vDS");
         }
         if (error) {
           std::wstring message = L"failed to remove vDS ProgramData: ";
           message += wide_from_ascii(error.message());
           append_installer_log(message);
-          MessageBoxW(nullptr,
-                      L"vDS was uninstalled, but C:\\ProgramData\\vDS could "
-                      L"not be removed.",
-                      L"vDS Setup", MB_OK | MB_ICONWARNING);
+          message = L"vDS was uninstalled, but ";
+          message += (vds::setup::program_data_directory() / L"vDS").wstring();
+          message += L" could not be removed.";
+          MessageBoxW(nullptr, message.c_str(), L"vDS Setup",
+                      MB_OK | MB_ICONWARNING);
         }
+      } else {
+        remove_directory_after_exit(
+            vds::setup::persistent_launcher_path().parent_path());
       }
       return 0;
     }
 
     bool restart_required = is_restart_exit_code(main_status);
-    const int dependency_status = run_dependency_script(
-        dependency_script, dependency_download_dir, L"Install");
-    if (!is_success_exit_code(dependency_status)) {
-      show_failed_status(L"installing USB/IP and HidHide", dependency_status);
-      std::filesystem::remove_all(work_dir);
-      append_installer_log(
-          L"dependency installation failed after the vDS MSI completed");
-      return dependency_status;
+    if (dependencies_missing) {
+      const int dependency_status = run_dependency_script(
+          dependency_script, dependency_download_dir, L"Install");
+      if (!is_success_exit_code(dependency_status)) {
+        show_failed_status(L"installing USB/IP and HidHide", dependency_status);
+        std::filesystem::remove_all(work_dir);
+        append_installer_log(
+            L"dependency installation failed after the vDS MSI completed");
+        return dependency_status;
+      }
+      restart_required =
+          restart_required || is_restart_exit_code(dependency_status);
     }
-    restart_required =
-        restart_required || is_restart_exit_code(dependency_status);
 
     const std::filesystem::path install_dir = installed_vds_dir();
     {
@@ -821,6 +1017,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     std::filesystem::remove_all(work_dir);
+    remove_legacy_setup_cache_after_exit();
     append_installer_log(L"vDS setup install finished");
     if (restart_required) {
       MessageBoxW(nullptr,
@@ -829,6 +1026,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                   L"vDS Setup", MB_OK | MB_ICONINFORMATION);
       return 3010;
     }
+    MessageBoxW(nullptr, L"vDS was installed successfully.", L"vDS Setup",
+                MB_OK | MB_ICONINFORMATION);
     return 0;
   } catch (const std::exception &error) {
     if (!work_dir.empty()) {

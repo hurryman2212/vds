@@ -3,12 +3,13 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("Download", "Install")]
+  [ValidateSet("Check", "Download", "Install")]
   [string]$Mode,
   [Parameter(Mandatory = $true)]
   [string]$DownloadDir,
   [Parameter(Mandatory = $true)]
-  [string]$LogPath
+  [string]$LogPath,
+  [string]$ProgressPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,6 +31,26 @@ function Write-VdsDependencyLog {
     -LiteralPath $LogPath `
     -Value "$Timestamp $Sanitized" `
     -Encoding Unicode
+}
+
+function Write-VdsDependencyProgress {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(-1, 100)]
+    [int]$PercentComplete,
+    [Parameter(Mandatory = $true)]
+    [string]$Message
+  )
+
+  if ([string]::IsNullOrWhiteSpace($ProgressPath)) {
+    return
+  }
+
+  $Sanitized = $Message -replace "[`r`n`t]", " "
+  [System.IO.File]::WriteAllText(
+    $ProgressPath,
+    "$PercentComplete`t$Sanitized",
+    [System.Text.Encoding]::ASCII)
 }
 
 function Test-UsbipInstalled {
@@ -167,8 +188,20 @@ function Test-VdsAuthenticodeSignature {
 function Save-VdsDependencyInstaller {
   param(
     [Parameter(Mandatory = $true)]
-    [object]$Dependency
+    [object]$Dependency,
+    [Parameter(Mandatory = $true)]
+    [int]$DependencyIndex,
+    [Parameter(Mandatory = $true)]
+    [int]$DependencyCount
   )
+
+  $ProgressStart = [Math]::Floor(
+    $DependencyIndex * 100 / $DependencyCount)
+  $ProgressEnd = [Math]::Floor(
+    ($DependencyIndex + 1) * 100 / $DependencyCount)
+  Write-VdsDependencyProgress `
+    -PercentComplete $ProgressStart `
+    -Message "Resolving the latest $($Dependency.Name) release..."
 
   $Asset = Get-VdsLatestReleaseAsset `
     -Repository $Dependency.Repository `
@@ -178,31 +211,115 @@ function Save-VdsDependencyInstaller {
 
   Write-VdsDependencyLog (
     "download $($Asset.browser_download_url) to $Destination")
-  Invoke-WebRequest `
-    -Uri $Asset.browser_download_url `
-    -Headers @{ "User-Agent" = "vDS-Setup" } `
-    -UseBasicParsing `
-    -OutFile $Destination
+
+  $Request = [System.Net.HttpWebRequest]::Create(
+    $Asset.browser_download_url)
+  $Request.AllowAutoRedirect = $true
+  $Request.UserAgent = "vDS-Setup"
+  $Response = $null
+  $InputStream = $null
+  $OutputStream = $null
+  try {
+    $Response = $Request.GetResponse()
+    if ($Response.ResponseUri.Scheme -ne "https") {
+      throw "refusing a non-HTTPS redirect for $($Asset.name)"
+    }
+
+    $ContentLength = $Response.ContentLength
+    $InputStream = $Response.GetResponseStream()
+    $OutputStream = [System.IO.File]::Create($Destination)
+    $Buffer = New-Object byte[] (64 * 1024)
+    [long]$Downloaded = 0
+    $LastPercent = -1
+    $LastReportedMiB = -1
+
+    while (($BytesRead = $InputStream.Read(
+        $Buffer, 0, $Buffer.Length)) -gt 0) {
+      $OutputStream.Write($Buffer, 0, $BytesRead)
+      $Downloaded += $BytesRead
+
+      if ($ContentLength -gt 0) {
+        $FilePercent = [Math]::Min(
+          100,
+          [Math]::Floor($Downloaded * 100 / $ContentLength))
+        $OverallPercent = [Math]::Min(
+          $ProgressEnd,
+          $ProgressStart + [Math]::Floor(
+            ($ProgressEnd - $ProgressStart) *
+            $Downloaded /
+            $ContentLength))
+        if ($FilePercent -ne $LastPercent) {
+          $DownloadedMiB = $Downloaded / 1MB
+          $TotalMiB = $ContentLength / 1MB
+          Write-VdsDependencyProgress `
+            -PercentComplete $OverallPercent `
+            -Message (
+              "Downloading $($Dependency.Name): " +
+              "$FilePercent% " +
+              "($($DownloadedMiB.ToString("0.0")) of " +
+              "$($TotalMiB.ToString("0.0")) MiB)")
+          $LastPercent = $FilePercent
+        }
+      } else {
+        $DownloadedMiB = [Math]::Floor($Downloaded / 1MB)
+        if ($DownloadedMiB -ne $LastReportedMiB) {
+          Write-VdsDependencyProgress `
+            -PercentComplete $ProgressStart `
+            -Message (
+              "Downloading $($Dependency.Name): " +
+              "$DownloadedMiB MiB")
+          $LastReportedMiB = $DownloadedMiB
+        }
+      }
+    }
+  } finally {
+    if ($OutputStream) {
+      $OutputStream.Dispose()
+    }
+    if ($InputStream) {
+      $InputStream.Dispose()
+    }
+    if ($Response) {
+      $Response.Dispose()
+    }
+  }
+
+  Write-VdsDependencyProgress `
+    -PercentComplete $ProgressEnd `
+    -Message "Verifying $($Dependency.Name)..."
 
   Test-VdsReleaseDigest -Asset $Asset -Path $Destination
   Test-VdsAuthenticodeSignature -Path $Destination
+  Write-VdsDependencyProgress `
+    -PercentComplete $ProgressEnd `
+    -Message "$($Dependency.Name) is ready."
 }
 
 function Install-VdsDependency {
   param(
     [Parameter(Mandatory = $true)]
-    [object]$Dependency
+    [object]$Dependency,
+    [Parameter(Mandatory = $true)]
+    [int]$DependencyIndex,
+    [Parameter(Mandatory = $true)]
+    [int]$DependencyCount
   )
 
   $InstallerPath = Join-Path $DownloadDir $Dependency.FileName
   if (!(Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
     throw "downloaded $($Dependency.Name) installer is missing"
   }
+  Write-VdsDependencyProgress `
+    -PercentComplete -1 `
+    -Message "Verifying the $($Dependency.Name) installer..."
   Test-VdsAuthenticodeSignature -Path $InstallerPath
 
   Write-VdsDependencyLog (
     "install $($Dependency.Name): $InstallerPath " +
     ($Dependency.Arguments -join " "))
+  Write-VdsDependencyProgress `
+    -PercentComplete -1 `
+    -Message "Installing $($Dependency.Name)..."
   $Process = Start-Process `
     -FilePath $InstallerPath `
     -ArgumentList $Dependency.Arguments `
@@ -216,6 +333,11 @@ function Install-VdsDependency {
       "$($Dependency.Name) installer failed with exit code " +
       $Process.ExitCode)
   }
+  $PercentComplete = [Math]::Floor(
+    ($DependencyIndex + 1) * 100 / $DependencyCount)
+  Write-VdsDependencyProgress `
+    -PercentComplete $PercentComplete `
+    -Message "$($Dependency.Name) was installed successfully."
   return $Process.ExitCode -in @(3010, 1641)
 }
 
@@ -253,7 +375,7 @@ try {
   }
 
   New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
-  $RestartRequired = $false
+  $MissingDependencies = @()
   foreach ($Dependency in $Dependencies) {
     $IsInstalled = $Dependency.IsInstalled
     if (& $IsInstalled) {
@@ -261,13 +383,51 @@ try {
         "$($Dependency.Name) is already installed; leave it unchanged")
       continue
     }
+    $MissingDependencies += $Dependency
+  }
 
-    if ($Mode -eq "Download") {
-      Save-VdsDependencyInstaller -Dependency $Dependency
+  $RestartRequired = $false
+  if ($Mode -eq "Check") {
+    if ($MissingDependencies.Count -eq 0) {
+      exit 0
+    }
+    Write-VdsDependencyLog (
+      "missing dependencies: " +
+      (($MissingDependencies | ForEach-Object { $_.Name }) -join ", "))
+    exit 10
+  } elseif ($Mode -eq "Download") {
+    if ($MissingDependencies.Count -eq 0) {
+      Write-VdsDependencyProgress `
+        -PercentComplete 100 `
+        -Message "USB/IP and HidHide are already installed."
     } else {
-      if (Install-VdsDependency -Dependency $Dependency) {
-        $RestartRequired = $true
+      for ($Index = 0; $Index -lt $MissingDependencies.Count; ++$Index) {
+        Save-VdsDependencyInstaller `
+          -Dependency $MissingDependencies[$Index] `
+          -DependencyIndex $Index `
+          -DependencyCount $MissingDependencies.Count
       }
+      Write-VdsDependencyProgress `
+        -PercentComplete 100 `
+        -Message "USB/IP and HidHide are ready."
+    }
+  } else {
+    if ($MissingDependencies.Count -eq 0) {
+      Write-VdsDependencyProgress `
+        -PercentComplete 100 `
+        -Message "USB/IP and HidHide are already installed."
+    } else {
+      for ($Index = 0; $Index -lt $MissingDependencies.Count; ++$Index) {
+        if (Install-VdsDependency `
+            -Dependency $MissingDependencies[$Index] `
+            -DependencyIndex $Index `
+            -DependencyCount $MissingDependencies.Count) {
+          $RestartRequired = $true
+        }
+      }
+      Write-VdsDependencyProgress `
+        -PercentComplete 100 `
+        -Message "USB/IP and HidHide installation is complete."
     }
   }
 

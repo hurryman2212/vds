@@ -45,6 +45,7 @@
 !/packaging/windows/*.ps1
 !/packaging/windows/launcher/
 !/packaging/windows/launcher/*.cc
+!/packaging/windows/launcher/*.hh
 !/packaging/windows/wix/
 !/packaging/windows/wix/*.wxl
 !/packaging/windows/wix/*.wxs
