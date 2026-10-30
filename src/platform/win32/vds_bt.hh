@@ -7,12 +7,17 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include "uapi/vds.h"
 #include "vds_io.hh"
 
 namespace vds::win {
+class BluetoothTransportError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 class BluetoothTransport {
 public:

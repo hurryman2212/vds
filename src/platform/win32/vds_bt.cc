@@ -40,6 +40,7 @@
 #include "vds_profile.hh"
 #include "vds_protocol.hh"
 #include "vds_win32.hh"
+#include "vds_tuning.hh"
 
 namespace vds::win {
 
@@ -56,7 +57,8 @@ constexpr const char *kHidDeviceClassRegistryPath =
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 constexpr std::size_t kMaxPendingHidOutputWrites = 64;
-constexpr std::size_t kMaxQueuedHidAudioOutputWrites = 4;
+constexpr std::size_t kMaxQueuedHidAudioOutputWrites = 2;
+constexpr auto kMaxHidAudioQueueAge = std::chrono::milliseconds(30);
 constexpr DWORD kHidInputReadStallTimeoutMs = 2000;
 
 class UniqueDeviceInfoSet {
@@ -419,6 +421,7 @@ public:
 
   std::optional<std::string> take_output_diagnostics(bool force) override {
     std::lock_guard guard(output_mutex_);
+    if (!output_error_.empty()) throw BluetoothTransportError(output_error_);
     if (!force && !output_diagnostic_pending_) {
       return std::nullopt;
     }
@@ -433,6 +436,7 @@ public:
     std::string message =
         "hid output writer queued=" + std::to_string(output_queued_count_) +
         " completed=" + std::to_string(output_completed_count_) +
+        " audio_completed=" + std::to_string(output_audio_completed_count_) +
         " rejected=" + std::to_string(output_rejected_count_) +
         " audio_coalesced=" + std::to_string(output_audio_coalesced_count_) +
         " queued_delta=" + std::to_string(output_queued_since_diagnostic_) +
@@ -441,7 +445,11 @@ public:
         " rejected_delta=" + std::to_string(output_rejected_since_diagnostic_) +
         " audio_coalesced_delta=" +
         std::to_string(output_audio_coalesced_since_diagnostic_) +
-        " pending=" + std::to_string(output_queue_.size());
+        " pending=" + std::to_string(output_queue_.size()) +
+        " write_active=" + std::to_string(output_write_active_) +
+        " queue_age_max_us=" + std::to_string(output_queue_age_max_us_) +
+        " write_max_us=" + std::to_string(output_write_max_us_) +
+        " completion_age_max_us=" + std::to_string(output_completion_age_max_us_);
     if (!output_error_.empty()) {
       message += " error=" + output_error_;
     }
@@ -451,6 +459,9 @@ public:
     output_completed_since_diagnostic_ = 0;
     output_rejected_since_diagnostic_ = 0;
     output_audio_coalesced_since_diagnostic_ = 0;
+    output_queue_age_max_us_ = 0;
+    output_write_max_us_ = 0;
+    output_completion_age_max_us_ = 0;
     return message;
   }
 
@@ -468,6 +479,8 @@ public:
 private:
   struct QueuedOutputWrite {
     std::vector<std::uint8_t> buffer;
+    std::size_t report_size = 0;
+    Clock::time_point queued_at{};
   };
 
   static UniqueHandle open_hid_device(const std::string &path,
@@ -534,7 +547,12 @@ private:
 
     HANDLE wait_handles[2] = {event.get(), stop_event_.get()};
     const DWORD wait_result =
-        WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+        WaitForMultipleObjects(2, wait_handles, FALSE, write ? 2000 : INFINITE);
+    if (wait_result == WAIT_TIMEOUT) {
+      CancelIoEx(handle, &overlapped);
+      (void)GetOverlappedResult(handle, &overlapped, &bytes_returned, TRUE);
+      throw BluetoothTransportError("HID output completion timed out");
+    }
     if (wait_result == WAIT_OBJECT_0 + 1) {
       CancelIoEx(handle, &overlapped);
       (void)GetOverlappedResult(handle, &overlapped, &bytes_returned, TRUE);
@@ -676,7 +694,7 @@ private:
     }
     std::vector<std::uint8_t> buffer(output_report_length_);
     std::copy(report.begin(), report.end(), buffer.begin());
-    return QueuedOutputWrite{std::move(buffer)};
+    return QueuedOutputWrite{std::move(buffer), report.size(), Clock::now()};
   }
 
   bool enqueue_output_report(std::span<const std::uint8_t> report) {
@@ -687,7 +705,7 @@ private:
     {
       std::lock_guard guard(output_mutex_);
       if (!output_error_.empty()) {
-        throw std::runtime_error(output_error_);
+        throw BluetoothTransportError(output_error_);
       }
       const auto is_queued_audio = [](const QueuedOutputWrite &queued_write) {
         return !queued_write.buffer.empty() &&
@@ -749,7 +767,10 @@ private:
              (output_queue_.empty() && !output_write_active_);
     });
     if (!output_error_.empty()) {
-      throw std::runtime_error(output_error_);
+      throw BluetoothTransportError(output_error_);
+    }
+    if (output_stop_requested_) {
+      throw BluetoothTransportError("HID output writer stopped before completion");
     }
   }
 
@@ -766,19 +787,30 @@ private:
         }
         write = std::move(output_queue_.front());
         output_queue_.pop_front();
+        const auto age = Clock::now() - write.queued_at;
+        if (write.buffer[0] == VDS_BT_HAPTICS_REPORT_ID && age > kMaxHidAudioQueueAge) {
+          ++output_audio_coalesced_count_;
+          ++output_audio_coalesced_since_diagnostic_;
+          output_diagnostic_pending_ = true;
+          output_cv_.notify_all();
+          continue;
+        }
+        output_queue_age_max_us_ = std::max(output_queue_age_max_us_,
+            static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(age).count()));
         output_write_active_ = true;
       }
 
+      const auto write_start = Clock::now();
       try {
-        std::size_t offset = 0;
-        while (offset < write.buffer.size()) {
-          const DWORD written = overlapped_io(
-              output_handle_.get(), true, write.buffer.data() + offset,
-              write.buffer.size() - offset, "HID output write");
-          if (written == 0) {
-            throw std::runtime_error("HID output write returned zero bytes");
-          }
-          offset += written;
+        // Sequence actual transmissions, not builders/enqueues: dropped audio
+        // must not consume a sequence, and control/audio share one counter.
+        amplify_rumble_report(std::span(write.buffer).first(write.report_size), tuning::gain_percent.load());
+        sequence_output_report(std::span(write.buffer).first(write.report_size),
+                               output_report_sequence_);
+        const DWORD written = overlapped_io(output_handle_.get(), true,
+            write.buffer.data(), write.buffer.size(), "HID output write");
+        if (written != write.buffer.size()) {
+          throw std::runtime_error("short HID output report write");
         }
       } catch (const std::exception &error) {
         std::lock_guard guard(output_mutex_);
@@ -793,7 +825,13 @@ private:
         std::lock_guard guard(output_mutex_);
         output_write_active_ = false;
         ++output_completed_count_;
+        if (write.buffer[0] == VDS_BT_HAPTICS_REPORT_ID) ++output_audio_completed_count_;
         ++output_completed_since_diagnostic_;
+        const auto completed_at = Clock::now();
+        output_write_max_us_ = std::max(output_write_max_us_,
+            static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(completed_at - write_start).count()));
+        output_completion_age_max_us_ = std::max(output_completion_age_max_us_,
+            static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(completed_at - write.queued_at).count()));
         output_diagnostic_pending_ = true;
       }
       output_cv_.notify_all();
@@ -837,12 +875,17 @@ private:
   std::string output_error_;
   std::uint64_t output_queued_count_ = 0;
   std::uint64_t output_completed_count_ = 0;
+  std::uint64_t output_audio_completed_count_ = 0;
   std::uint64_t output_rejected_count_ = 0;
   std::uint64_t output_audio_coalesced_count_ = 0;
   std::uint64_t output_queued_since_diagnostic_ = 0;
   std::uint64_t output_completed_since_diagnostic_ = 0;
   std::uint64_t output_rejected_since_diagnostic_ = 0;
   std::uint64_t output_audio_coalesced_since_diagnostic_ = 0;
+  std::uint8_t output_report_sequence_ = 0;
+  std::int64_t output_queue_age_max_us_ = 0;
+  std::int64_t output_write_max_us_ = 0;
+  std::int64_t output_completion_age_max_us_ = 0;
   bool output_stop_requested_ = false;
   bool output_write_active_ = false;
   bool output_diagnostic_pending_ = false;
