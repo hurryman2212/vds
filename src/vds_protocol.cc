@@ -166,8 +166,10 @@ constexpr auto make_crc32_table() {
 
 constexpr auto kCrc32Table = make_crc32_table();
 
-std::int8_t s16_to_s8_haptic(std::int16_t sample) {
-  const int value = std::clamp(static_cast<int>(sample / 256), -128, 127);
+std::int8_t s16_to_s8_haptic(int sample) {
+  const int magnitude = sample < 0 ? -static_cast<int>(sample) : sample;
+  const int rounded = (magnitude + 128) / 256;
+  const int value = std::clamp(sample < 0 ? -rounded : rounded, -128, 127);
   return static_cast<std::int8_t>(value);
 }
 
@@ -221,8 +223,10 @@ resample_speaker_pcm(std::span<const std::int16_t> pcm,
 }
 
 HapticsChunk resample_haptics_pcm(std::span<const std::int16_t> pcm,
-                                  std::size_t pcm_frames) {
+                                  std::size_t pcm_frames, AudioChunk &metrics,
+                                  int gain_percent) {
   HapticsChunk chunk{};
+  metrics.diagnostic_gain_percent = gain_percent;
   constexpr std::size_t haptics_frames = kHapticsSampleSize / kSpeakerChannels;
 
   for (std::size_t frame = 0; frame < haptics_frames; ++frame) {
@@ -234,14 +238,37 @@ HapticsChunk resample_haptics_pcm(std::span<const std::int16_t> pcm,
     for (std::size_t sample = begin; sample < end; ++sample) {
       left_sum += pcm[sample * kSpeakerChannels + 0];
       right_sum += pcm[sample * kSpeakerChannels + 1];
+      for (std::size_t channel = 0; channel < 2; ++channel) {
+        const int value = pcm[sample * kSpeakerChannels + channel];
+        metrics.diagnostic_raw_energy += double(value) * value;
+        ++metrics.diagnostic_raw_count;
+        metrics.diagnostic_raw_peak = std::max(metrics.diagnostic_raw_peak,
+                                               value < 0 ? -value : value);
+      }
     }
 
     const auto left =
         static_cast<std::int16_t>(left_sum / static_cast<std::int32_t>(count));
     const auto right =
         static_cast<std::int16_t>(right_sum / static_cast<std::int32_t>(count));
-    chunk[frame * kSpeakerChannels + 0] = s16_to_s8_haptic(left);
-    chunk[frame * kSpeakerChannels + 1] = s16_to_s8_haptic(right);
+    const int scaled_left = static_cast<int>(left) * gain_percent / 100;
+    const int scaled_right = static_cast<int>(right) * gain_percent / 100;
+    chunk[frame * kSpeakerChannels + 0] = s16_to_s8_haptic(scaled_left);
+    chunk[frame * kSpeakerChannels + 1] = s16_to_s8_haptic(scaled_right);
+    metrics.diagnostic_clipped_samples += scaled_left > 32639 || scaled_left < -32895;
+    metrics.diagnostic_clipped_samples += scaled_right > 32639 || scaled_right < -32895;
+    const std::array<int, 2> averages{left, right};
+    for (std::size_t channel = 0; channel < 2; ++channel) {
+      const int value = averages[channel];
+      const int quantized = chunk[frame * 2 + channel];
+      metrics.diagnostic_average_energy += double(value) * value * count;
+      metrics.diagnostic_quantized_energy +=
+          double(quantized) * quantized * 65536.0 * count;
+      metrics.diagnostic_output_peak = std::max(metrics.diagnostic_output_peak,
+                                                quantized < 0 ? -quantized : quantized);
+      metrics.diagnostic_nonzero_averages += value != 0;
+      metrics.diagnostic_erased_averages += value != 0 && quantized == 0;
+    }
   }
 
   return chunk;
@@ -423,6 +450,35 @@ PcmAudioExtractor::PcmAudioExtractor(PcmAudioExtractor &&) noexcept = default;
 PcmAudioExtractor &
 PcmAudioExtractor::operator=(PcmAudioExtractor &&) noexcept = default;
 
+void amplify_rumble_report(std::span<std::uint8_t> report, int gain_percent) {
+  if (gain_percent < 0 || gain_percent > 300) throw std::invalid_argument("invalid rumble gain");
+  if (report.empty()) return;
+  std::size_t offset = 0;
+  if (report[0] == VDS_BT_STATE_REPORT_ID) offset = 3;
+  else if (report[0] == VDS_BT_HAPTICS_REPORT_ID && report.size() > 13 && report[11] == 0x90) offset = 13;
+  else if (report[0] == 0x32 && report.size() > 4 && report[2] == 0x90) offset = 4;
+  else return;
+  if (report.size() < offset + kSetStateSize + 4) return;
+  if ((report[offset] & 3) == 0 && (report[offset+38] & 4) == 0) return;
+  for (std::size_t channel = 2; channel <= 3; ++channel)
+    report[offset+channel] = static_cast<std::uint8_t>(
+        std::min(255, (int(report[offset+channel])*gain_percent+50)/100));
+}
+
+void PcmAudioExtractor::set_haptics_gain(int percent) {
+  if (percent < 0 || percent > 300) throw std::invalid_argument("invalid haptics gain");
+  haptics_gain_percent_ = percent;
+}
+
+void sequence_output_report(std::span<std::uint8_t> report, std::uint8_t &sequence) {
+  if (report.size() < 6 ||
+      (report[0] != VDS_BT_STATE_REPORT_ID && report[0] != 0x32 &&
+       report[0] != VDS_BT_HAPTICS_REPORT_ID)) return;
+  report[1] = static_cast<std::uint8_t>((sequence << 4) | (report[1] & 0x0f));
+  sequence = (sequence + 1) & 0x0f;
+  fill_output_report_checksum(report);
+}
+
 void fill_output_report_checksum(std::span<std::uint8_t> report) {
   if (report.size() < sizeof(std::uint32_t)) {
     throw std::invalid_argument("output report is too small for CRC");
@@ -599,7 +655,8 @@ bool DsOutputState::apply_usb_output_report(
   set_state_bit(state_[0], 1, decoded.use_rumble_not_haptics);
   set_state_bit(state_[38], 2, decoded.enable_improved_rumble_emulation);
 
-  if (decoded.use_rumble_not_haptics || decoded.enable_rumble_emulation) {
+  if (decoded.use_rumble_not_haptics || decoded.enable_rumble_emulation ||
+      decoded.enable_improved_rumble_emulation) {
     copy_state_bytes(state_, update,
                      offsetof(vds_set_state_data, rumble_emulation_right), 2);
   }
@@ -637,6 +694,15 @@ bool DsOutputState::apply_usb_output_report(
     state_[kOutputFlag1Offset] |= kOutputFlag1AudioControl2Enable;
     audio_control2_ = update[kOutputAudioControl2Offset];
     copy_state_bytes(state_, update, kOutputAudioControl2Offset, 1);
+  }
+  if (decoded.allow_motor_power_level) {
+    set_state_bit(state_[1], 6, true);
+    // Copy both reduction nibbles without changing the game's requested power.
+    copy_state_bytes(state_, update, 36, 1);
+  }
+  if (decoded.allow_haptic_low_pass_filter) {
+    set_state_bit(state_[1], 5, true);
+    set_state_bit(state_[39], 0, decoded.haptic_low_pass_filter);
   }
   if (decoded.allow_audio_mute) {
     state_[kOutputFlag1Offset] |= kOutputFlag1PowerSaveControlEnable;
@@ -882,7 +948,7 @@ PcmAudioExtractor::push_usb_audio(std::span<const std::uint8_t> pcm_bytes) {
     chunk.haptics = resample_haptics_pcm(
         std::span<const std::int16_t>(haptics_pcm_.data(),
                                       pcm_window_frames_ * kSpeakerChannels),
-        pcm_window_frames_);
+        pcm_window_frames_, chunk, haptics_gain_percent_);
     chunk.speaker = speaker_encoder_->encode(
         std::span<const std::int16_t>(speaker_pcm_.data(),
                                       pcm_window_frames_ * kSpeakerChannels),

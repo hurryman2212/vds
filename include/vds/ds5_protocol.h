@@ -87,8 +87,8 @@ struct vds_set_state_data {
 	vds_u8 right_trigger_ffb[11];
 	vds_u8 left_trigger_ffb[11];
 	vds_u32 host_timestamp;
-	vds_u8 trigger_motor_power_reduction : 4;
 	vds_u8 rumble_motor_power_reduction : 4;
+	vds_u8 trigger_motor_power_reduction : 4;
 	vds_u8 speaker_comp_pre_gain : 3;
 	vds_u8 beamforming_enable : 1;
 	vds_u8 unk_audio_control2 : 4;
