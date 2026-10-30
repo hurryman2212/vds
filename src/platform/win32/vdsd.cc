@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -46,6 +48,8 @@
 #include "vds_protocol.hh"
 #include "vds_usbip.hh"
 #include "vds_win32.hh"
+#include "vds_tuning.hh"
+#include "vds_playout.hh"
 #include "vdsd_common.hh"
 
 namespace {
@@ -64,19 +68,14 @@ constexpr const char *kWindowsHidHideProviderUnavailable =
     "HidHide is not installed or HidHideCLI.exe is unavailable";
 constexpr DWORD kDeviceShareMode =
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-constexpr std::size_t kMaxPendingAudioChunks = 64;
-constexpr std::size_t kAudioPrimeChunks = 24;
-constexpr std::size_t kAudioFreshQueueChunks = 48;
+constexpr std::size_t kMaxPendingAudioChunks = 12;
 constexpr std::size_t kAudioLowWatermarkChunks = 0;
-constexpr std::size_t kAudioHighWatermarkChunks = 44;
+constexpr std::size_t kAudioHighWatermarkChunks = 8;
 constexpr std::size_t kWindowsPcmWindowFrames = vds::kPcmWindowFrames;
-constexpr int kWindowsHapticsSampleMin = -128;
-constexpr int kWindowsHapticsSampleMax = 127;
 constexpr auto kAudioOutputBaseInterval = std::chrono::microseconds(
     (static_cast<std::int64_t>(kWindowsPcmWindowFrames) * 1000000 +
      VDS_AUDIO_SAMPLE_RATE / 2) /
     VDS_AUDIO_SAMPLE_RATE);
-constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(300);
 constexpr auto kAudioUnderflowKeepaliveDelay = std::chrono::milliseconds(25);
 constexpr auto kAudioLowWatermarkPaceDelay = std::chrono::microseconds(0);
 constexpr auto kAudioHighWatermarkCatchupDelay = std::chrono::microseconds(0);
@@ -309,6 +308,13 @@ audio_output_interval_for_pending(std::size_t pending_chunks,
 
 struct BridgeState {
   std::mutex mutex;
+  vds::AudioChunk diagnostic_totals{};
+  Clock::time_point diagnostic_start{};
+  std::uint64_t diagnostic_chunks = 0;
+  std::int64_t diagnostic_queue_age_max_us = 0;
+  vds::win::AdaptivePlayout playout;
+  int diagnostic_cached_gain = 100;
+  std::vector<std::uint8_t> diagnostic_usb_output;
   vds::DsOutputState output_state;
   vds::PcmAudioExtractor extractor{kWindowsPcmWindowFrames};
   vds::PcmAudioExtractor waveout_extractor{kWindowsPcmWindowFrames};
@@ -692,6 +698,8 @@ bool try_send_bt_output_report(BluetoothTransport &bluetooth,
       bluetooth.write_interrupt_packet(packet);
       sent = true;
     }
+  } catch (const vds::win::BluetoothTransportError &) {
+    throw;
   } catch (const std::exception &error) {
     logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
                std::string(label) + " output report ignored: " + error.what());
@@ -707,26 +715,34 @@ bool try_send_bt_output_report(BluetoothTransport &bluetooth,
   return sent;
 }
 
-std::optional<vds::BtStateReport>
-build_bt_state_if_changed(BridgeState &state) {
-  std::lock_guard guard(state.mutex);
-  const vds::DsState current = state.output_state.state();
-  if (state.have_last_sent_state && state.last_sent_state == current) {
-    return std::nullopt;
-  }
-  const auto report = state.output_state.build_bt_state_report();
-  state.last_sent_state = current;
-  state.have_last_sent_state = true;
-  return report;
-}
-
 void send_bt_state_if_changed(BluetoothTransport &bluetooth, BridgeState &state,
                               vds::Logger &logger,
                               std::mutex &bluetooth_mutex) {
-  const auto report = build_bt_state_if_changed(state);
-  if (report) {
-    (void)try_send_bt_output_report(bluetooth, *report, logger, bluetooth_mutex,
-                                    "state");
+  // Serialize snapshot creation with submission. Cache only the exact state
+  // whose synchronous Windows HID write completed, never a newer live state.
+  std::lock_guard output_guard(bluetooth_mutex);
+  vds::DsState snapshot;
+  vds::BtStateReport report;
+  int gain = 100;
+  {
+    std::lock_guard guard(state.mutex);
+    snapshot = state.output_state.state();
+    gain = vds::win::tuning::gain_percent.load();
+    if (state.have_last_sent_state && state.last_sent_state == snapshot &&
+        state.diagnostic_cached_gain == gain) return;
+    report = state.output_state.build_bt_state_report();
+  }
+  try {
+    bluetooth.write_interrupt_packet(hidp_output_packet(report));
+    std::lock_guard guard(state.mutex);
+    state.last_sent_state = snapshot;
+    state.diagnostic_cached_gain = gain;
+    state.have_last_sent_state = true;
+  } catch (const vds::win::BluetoothTransportError &) {
+    throw;
+  } catch (const std::exception &error) {
+    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
+               std::string("state write failed; retained for retry: ") + error.what());
   }
 }
 
@@ -862,6 +878,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
     {
       std::lock_guard guard(state.mutex);
       applied = state.output_state.apply_usb_output_report(frame.payload);
+      state.diagnostic_usb_output = frame.payload;
       if (applied && (state.audio_out_stream_active || state.waveout_active)) {
         state.output_state.set_audio_out_stream_active(
             true, state.waveout_active ? !state.waveout_speaker_selected
@@ -1055,6 +1072,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
     std::lock_guard guard(state.mutex);
     const bool reset_audio_route =
         !state.audio_out_stream_active || state.waveout_active;
+    state.playout.observe(audio_start);
     if (reset_audio_route) {
       state.waveout_active = false;
       state.output_state.set_audio_out_stream_active(true,
@@ -1097,6 +1115,7 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
       state.extractor = vds::PcmAudioExtractor{kWindowsPcmWindowFrames};
       audio_route_activated = true;
     }
+    state.extractor.set_haptics_gain(vds::win::tuning::gain_percent.load());
     chunks = state.extractor.push_usb_audio(frame.payload);
     const auto extract_duration = Clock::now() - extract_start;
     if (!chunks.empty() && !state.audio_pcm_stream_active) {
@@ -1167,7 +1186,8 @@ void handle_virtual_frame(HANDLE virtual_device, BluetoothTransport &bluetooth,
       state.audio_underflow_reported = false;
     }
 
-    for (const auto &chunk : chunks) {
+    for (auto chunk : chunks) {
+      chunk.queued_at = audio_start;
       if (state.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
         state.pending_audio_chunks.pop_front();
         ++dropped_chunks;
@@ -1457,9 +1477,9 @@ void send_initial_bluetooth_reports(BluetoothTransport &bluetooth,
     state.audio_in_stream_active = false;
     state.mic_decoder = vds::MicAudioDecoder{};
     state.output_state.set_headset_mic_plugged(state.headset_mic_plugged);
-    state.last_sent_state = state.output_state.state();
-    state.have_last_sent_state = true;
+    state.have_last_sent_state = false;
   }
+  send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
   logger.log(vds::LogScope::InputAudio, vds::LogLevel::Info,
              "startup mic stream inactive until USB capture opens");
 }
@@ -1496,7 +1516,9 @@ void enqueue_waveout_chunk(BridgeState &state) {
     if (state.pending_audio_chunks.size() >= kMaxPendingAudioChunks) {
       break;
     }
-    state.pending_audio_chunks.push_back(chunk);
+    auto timed_chunk = chunk;
+    timed_chunk.queued_at = Clock::now();
+    state.pending_audio_chunks.push_back(timed_chunk);
   }
 }
 
@@ -1519,7 +1541,6 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
   bool sending_keepalive = false;
   bool sending_concealment = false;
   bool haptics_sent_first_seen = false;
-  bool haptics_limited = false;
   bool low_watermark_paced = false;
   bool high_watermark_catchup = false;
   bool have_schedule_late = false;
@@ -1531,7 +1552,6 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
   Clock::time_point scheduled_send_time{};
   Clock::time_point send_time{};
   vds::AudioChunk sent_audio_chunk{};
-  std::optional<vds::BtStateReport> stream_stop_report;
   bool have_sent_audio_chunk = false;
   bool audio_route_deactivated = false;
 
@@ -1543,8 +1563,6 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
         return kAudioFlushIdleSleep;
       }
 
-      state.audio_jitter_buffering = false;
-      state.audio_jitter_buffer_start = {};
       if (state.audio_queue_empty_since == Clock::time_point{}) {
         state.audio_queue_empty_since = now;
       }
@@ -1558,6 +1576,8 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
       }
       if (empty_duration < kAudioUnderflowKeepaliveDelay &&
           state.last_audio_chunk) {
+        state.audio_jitter_buffering = true;
+        state.audio_jitter_buffer_start = {};
         vds::AudioChunk chunk = *state.last_audio_chunk;
         chunk.haptics.fill(0);
         chunk.has_haptics_signal = false;
@@ -1589,7 +1609,7 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
               "audio packet queue underflow during active stream count=" +
                   std::to_string(state.audio_underflow_count) +
                   " queued=" + std::to_string(state.audio_queued_count) +
-                  " sent=" + std::to_string(state.audio_sent_count) +
+                  " enqueued=" + std::to_string(state.audio_sent_count) +
                   " keepalive_sent=" +
                   std::to_string(state.audio_keepalive_sent_count) +
                   " dropped=" + std::to_string(state.audio_dropped_count) +
@@ -1622,12 +1642,6 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
           state.next_haptics_send_time = {};
           state.last_audio_chunk.reset();
 
-          const vds::DsState current = state.output_state.state();
-          if (!state.have_last_sent_state || state.last_sent_state != current) {
-            stream_stop_report = state.output_state.build_bt_state_report();
-            state.last_sent_state = current;
-            state.have_last_sent_state = true;
-          }
           audio_route_deactivated = true;
         }
         state.next_haptics_send_time = {};
@@ -1639,8 +1653,8 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
           state.audio_jitter_buffer_start = now;
         }
         const auto buffer_age = now - state.audio_jitter_buffer_start;
-        if (state.pending_audio_chunks.size() < kAudioPrimeChunks &&
-            buffer_age < kAudioJitterBufferMaxDelay) {
+        const auto available = state.pending_audio_chunks.size() * kAudioOutputBaseInterval;
+        if (available < state.playout.target() && buffer_age < state.playout.target()) {
           return std::chrono::milliseconds(1);
         }
         state.audio_jitter_buffering = false;
@@ -1655,22 +1669,65 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
             std::min<Clock::duration>(kAudioFlushIdleSleep, remaining));
       }
 
-      while (state.pending_audio_chunks.size() > kAudioFreshQueueChunks) {
+      const auto fresh_limit = state.playout.queue_limit();
+      const auto max_age = state.playout.max_age();
+      while (state.pending_audio_chunks.size() > fresh_limit ||
+             (!state.pending_audio_chunks.empty() &&
+              now - state.pending_audio_chunks.front().queued_at > max_age)) {
         state.pending_audio_chunks.pop_front();
         ++state.audio_dropped_count;
         ++state.audio_stale_dropped_count;
         ++stale_dropped_now;
       }
+      if (state.pending_audio_chunks.empty()) return kAudioFlushIdleSleep;
       const vds::AudioChunk chunk = state.pending_audio_chunks.front();
+      // Own this chunk now: a producer may otherwise evict the front while
+      // the sender releases state.mutex to write, causing a second removal.
+      state.pending_audio_chunks.pop_front();
+      state.diagnostic_queue_age_max_us = std::max(state.diagnostic_queue_age_max_us,
+          static_cast<std::int64_t>(duration_us(now - chunk.queued_at)));
+      auto &d = state.diagnostic_totals;
+      if (state.diagnostic_start == Clock::time_point{}) state.diagnostic_start = now;
+      ++state.diagnostic_chunks;
+      d.diagnostic_raw_energy += chunk.diagnostic_raw_energy;
+      d.diagnostic_average_energy += chunk.diagnostic_average_energy;
+      d.diagnostic_quantized_energy += chunk.diagnostic_quantized_energy;
+      d.diagnostic_raw_count += chunk.diagnostic_raw_count;
+      d.diagnostic_nonzero_averages += chunk.diagnostic_nonzero_averages;
+      d.diagnostic_erased_averages += chunk.diagnostic_erased_averages;
+      d.diagnostic_clipped_samples += chunk.diagnostic_clipped_samples;
+      d.diagnostic_raw_peak = std::max(d.diagnostic_raw_peak, chunk.diagnostic_raw_peak);
+      d.diagnostic_output_peak = std::max(d.diagnostic_output_peak, chunk.diagnostic_output_peak);
+      if (now - state.diagnostic_start >= std::chrono::seconds(1)) {
+        const double count = std::max<std::uint64_t>(1, d.diagnostic_raw_count);
+        const auto &s = state.output_state.state();
+        logger.log(vds::LogScope::Output, vds::LogLevel::Info,
+          "HAPTIC_DIAG baseline=0 chunks=" + std::to_string(state.diagnostic_chunks) +
+          " gain_percent=" + std::to_string(chunk.diagnostic_gain_percent) +
+          " target_latency_us=" + std::to_string(state.playout.target().count()) +
+          " clipped_samples=" + std::to_string(d.diagnostic_clipped_samples) +
+          " queue_age_max_us=" + std::to_string(state.diagnostic_queue_age_max_us) +
+          " raw_rms=" + std::to_string(std::sqrt(d.diagnostic_raw_energy / count)) +
+          " averaged_rms=" + std::to_string(std::sqrt(d.diagnostic_average_energy / count)) +
+          " quantized_rms=" + std::to_string(std::sqrt(d.diagnostic_quantized_energy / count)) +
+          " raw_peak=" + std::to_string(d.diagnostic_raw_peak) +
+          " output_peak_s8=" + std::to_string(d.diagnostic_output_peak) +
+          " nonzero_averages=" + std::to_string(d.diagnostic_nonzero_averages) +
+          " erased_averages=" + std::to_string(d.diagnostic_erased_averages) +
+          " haptic_power_save=" + std::to_string((s[9] >> 2) & 1) +
+          " haptic_mute=" + std::to_string((s[9] >> 7) & 1) +
+          " motor_reduction=" + std::to_string(s[36] & 0x0f) +
+          " trigger_reduction=" + std::to_string(s[36] >> 4) +
+          " state=" + hex_bytes(s, 47, ':', false) +
+          " usb_report=" + hex_bytes(state.diagnostic_usb_output, 48, ':', false));
+        d = {};
+        state.diagnostic_chunks = 0;
+        state.diagnostic_queue_age_max_us = 0;
+        state.diagnostic_start = now;
+      }
       has_signal = chunk.has_signal;
       has_haptics_signal = chunk.has_haptics_signal;
-      vds::HapticsChunk haptics = chunk.haptics;
-      for (std::int8_t &sample : haptics) {
-        const auto limited = static_cast<std::int8_t>(std::clamp<int>(
-            sample, kWindowsHapticsSampleMin, kWindowsHapticsSampleMax));
-        haptics_limited = haptics_limited || limited != sample;
-        sample = limited;
-      }
+      const vds::HapticsChunk &haptics = chunk.haptics;
       const bool route_headset = state.waveout_active
                                      ? !state.waveout_speaker_selected
                                      : state.headset_plugged;
@@ -1688,27 +1745,34 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
   }
 
   if (audio_route_deactivated) {
-    if (stream_stop_report) {
-      (void)try_send_bt_output_report(bluetooth, *stream_stop_report, logger,
-                                      bluetooth_mutex, "state");
-    }
+    send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
                "audio out stream auto-deactivated after PCM drain");
     return next_sleep;
   }
 
   const auto write_start = Clock::now();
-  const bool sent = try_send_bt_output_report(bluetooth, packet, logger,
-                                              bluetooth_mutex, "audio");
+  bool sent = false;
+  try {
+    std::lock_guard output_guard(bluetooth_mutex);
+    {
+      std::lock_guard guard(state.mutex);
+      const auto &current = state.output_state.state();
+      std::copy(current.begin(), current.end(), packet.begin() + 13);
+    }
+    vds::fill_output_report_checksum(packet);
+    sent = bluetooth.try_write_interrupt_packet(hidp_output_packet(packet));
+  } catch (const vds::win::BluetoothTransportError &) {
+    throw;
+  } catch (const std::exception &error) {
+    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
+               std::string("audio enqueue failed: ") + error.what());
+  }
   const auto write_duration = Clock::now() - write_start;
   if (!sent) {
     std::size_t pending_count = 0;
     {
       std::lock_guard guard(state.mutex);
-      if (!sending_keepalive && !sending_concealment &&
-          !state.pending_audio_chunks.empty()) {
-        state.pending_audio_chunks.pop_front();
-      }
       if (sending_keepalive) {
         ++state.audio_keepalive_blocked_count;
       } else {
@@ -1746,16 +1810,13 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
 
   {
     std::lock_guard guard(state.mutex);
-    if (!sending_keepalive && !sending_concealment &&
-        !state.pending_audio_chunks.empty()) {
-      state.pending_audio_chunks.pop_front();
-    }
     pending_after_pop = state.pending_audio_chunks.size();
+    // An asynchronous packet may apply another full state, but its completion
+    // is not yet known. Do not let an older cache suppress a later state send.
+    state.have_last_sent_state = false;
     if (pending_after_pop == 0) {
       state.audio_jitter_buffer_start = {};
     }
-    state.last_sent_state = state.output_state.state();
-    state.have_last_sent_state = true;
     if (sending_keepalive) {
       ++state.audio_keepalive_sent_count;
       keepalive_sent_count = state.audio_keepalive_sent_count;
@@ -1820,7 +1881,7 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
         std::string(sending_keepalive
                         ? "audio keepalive sent count="
                         : (sending_concealment ? "audio concealment sent count="
-                                               : "audio sent count=")) +
+                                               : "audio enqueued count=")) +
         std::to_string(
             sending_keepalive
                 ? keepalive_sent_count
@@ -1840,9 +1901,6 @@ Clock::duration flush_pending_audio_chunk(BluetoothTransport &bluetooth,
     }
     if (schedule_reset) {
       message += " schedule_reset=yes";
-    }
-    if (haptics_limited) {
-      message += " haptics_limited=yes";
     }
     if (low_watermark_paced) {
       message += " low_watermark_pace=yes";
@@ -1920,8 +1978,8 @@ void maybe_log_audio_summary(BluetoothTransport &bluetooth, BridgeState &state,
         " pending=" + std::to_string(state.pending_audio_chunks.size()) +
         " usb_frames=" + std::to_string(state.audio_usb_frame_count) +
         " usb_delta=" + std::to_string(usb_delta) +
-        " sent=" + std::to_string(state.audio_sent_count) +
-        " sent_delta=" + std::to_string(sent_delta) +
+        " enqueued=" + std::to_string(state.audio_sent_count) +
+        " enqueued_delta=" + std::to_string(sent_delta) +
         " concealed=" + std::to_string(state.audio_concealed_count) +
         " concealed_delta=" + std::to_string(concealed_delta) +
         " keepalive=" + std::to_string(state.audio_keepalive_sent_count) +
@@ -2464,11 +2522,68 @@ bool worker_is_connected(const BridgeWorker &worker) {
   return !worker.done.load() && !worker.stop_requested.load();
 }
 
+std::filesystem::path tuning_path(const std::string &db_path) {
+  return std::filesystem::path(db_path + ".tuning.json");
+}
+
+void save_gain(const std::string &db_path, int gain) {
+  const auto destination = tuning_path(db_path);
+  auto temporary = destination; temporary += ".tmp";
+  std::ofstream out(temporary, std::ios::trunc);
+  out << "{" << vds::jsonl_string_field("gain_percent", std::to_string(gain)) << "}\n";
+  out.flush();
+  if (!out) throw std::runtime_error("failed to save gain settings");
+  out.close();
+  if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    throw std::runtime_error("failed to commit gain settings: " + win32_error_message(GetLastError()));
+}
+
+void load_gain(const std::string &db_path, vds::Logger &logger) {
+  try {
+    const auto path = tuning_path(db_path);
+    if (!std::filesystem::exists(path)) return;
+    std::ifstream in(path);
+    std::string line;
+    if (!std::getline(in, line)) throw std::runtime_error("cannot read gain settings");
+    const auto fields = vds::parse_jsonl_object(line, "gain settings");
+    vds::win::tuning::gain_percent = vds::win::tuning::parse_gain(
+        vds::require_jsonl_string(fields, "gain_percent", "gain settings"));
+  } catch (const std::exception &error) {
+    logger.log(vds::LogScope::Config, vds::LogLevel::Warn,
+               std::string("gain settings not loaded: ") + error.what());
+  }
+}
+
+std::string tuning_reply() {
+  return "{\"OK\":true,\"gain_percent\":" + std::to_string(vds::win::tuning::gain_percent.load()) +
+      ",\"latency\":\"adaptive-realtime\",\"gain_scope\":\"all-controllers\"}\n";
+}
+
 std::string handle_supervisor_control_command(
     const std::string &command,
     const std::vector<std::unique_ptr<BridgeWorker>> &workers,
     const std::string &db_path, std::uint32_t &trace_flags,
     bool &reload_requested, vds::Logger &logger) {
+  try {
+    const auto fields = vds::parse_jsonl_object(command, "control request");
+    const auto name = vds::require_jsonl_string(fields, "command", "control request");
+    if (name == "gain") {
+      constexpr std::string_view expected[] = {"command", "value"};
+      vds::reject_unknown_jsonl_fields(fields, expected, "gain request");
+      const int gain = vds::win::tuning::parse_gain(vds::require_jsonl_string(fields, "value", "gain request"));
+      save_gain(db_path, gain); // Apply only after a successful durable update.
+      vds::win::tuning::gain_percent = gain;
+      logger.log(vds::LogScope::Control, vds::LogLevel::Info, "gain_percent=" + std::to_string(gain));
+      return tuning_reply();
+    }
+    if (name == "tuning") {
+      constexpr std::string_view expected[] = {"command"};
+      vds::reject_unknown_jsonl_fields(fields, expected, "tuning request");
+      return tuning_reply();
+    }
+  } catch (const std::exception &error) {
+    return "{\"OK\":false," + vds::jsonl_string_field("error", error.what()) + "}\n";
+  }
   std::vector<vds::VdsdControlControllerStatus> controller_statuses;
   controller_statuses.reserve(workers.size());
   for (const auto &worker : workers) {
@@ -2545,6 +2660,7 @@ void run_configured_bridge_worker(vds::ControllerConfig config,
 }
 
 void run_bridge_supervisor(const Options &options, vds::Logger &logger) {
+  load_gain(options.db_path, logger);
   std::vector<std::unique_ptr<BridgeWorker>> workers;
   std::vector<vds::VdsdWorkerFailureBackoff> worker_failure_backoffs;
   std::vector<std::string> discovery_warned_states;
@@ -2969,7 +3085,7 @@ int run_windows_daemon(int argc, char **argv, bool service_mode) {
       if (service_mode) {
         update_service_status(SERVICE_RUNNING);
         logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-                   "Windows service started");
+                   "Windows service started HAPTIC_FIXES_V3");
       }
 
       run_bridge_supervisor(options, logger);

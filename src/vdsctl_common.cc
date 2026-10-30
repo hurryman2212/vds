@@ -8,6 +8,9 @@
 
 #include "jsonl.hh"
 #include "vdsctl_common.hh"
+#ifdef _WIN32
+#include "platform/win32/vds_tuning.hh"
+#endif
 
 namespace vds {
 
@@ -69,6 +72,10 @@ std::string vdsctl_usage(std::string_view version,
           "  vdsctl list\n"
           "  vdsctl list-targets\n"
           "  vdsctl trace on|off [--scope <scope>[,<scope>...]]\n"
+#ifdef _WIN32
+          "  vdsctl gain <0..300>  (percent; 100 = unchanged)\n"
+          "  vdsctl tuning        (show persistent gain and realtime policy)\n"
+#endif
           "\n"
           "trace scopes:\n"
           "  all, input, input-audio, input-control, output\n";
@@ -108,6 +115,17 @@ int run_vdsctl_app(int argc, char **argv, std::string_view version,
       return 0;
     }
 
+#ifdef _WIN32
+    if (std::string_view(argv[1]) == "gain" || std::string_view(argv[1]) == "tuning") {
+      const bool setting = std::string_view(argv[1]) == "gain";
+      require_vdsctl_arg_count(argc, setting ? 3 : 2);
+      std::string request = "{" + jsonl_string_field("command", argv[1]);
+      if (setting) request += "," + jsonl_string_field("value", std::to_string(win::tuning::parse_gain(argv[2])));
+      const auto reply = platform.request_control(request + "}\n");
+      std::cout << reply;
+      return reply.find("\"OK\":false") == std::string::npos ? 0 : 1;
+    }
+#endif
     switch (parse_vdsctl_command(argv[1])) {
     case VdsctlCommand::Attach:
       std::cout << run_vdsctl_attach(argc, argv, platform.request_control);
