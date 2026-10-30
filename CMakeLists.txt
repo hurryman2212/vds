@@ -146,6 +146,27 @@ if(WIN32)
             vds_win32
             vdsctl_common
             advapi32)
+
+  option(VDS_BUILD_TESTS "Build offline haptic protocol and scheduler tests" OFF)
+  if(VDS_BUILD_TESTS)
+    enable_testing()
+    add_executable(vds_metrics_test diagnostics/metrics_test.cc)
+    target_link_libraries(vds_metrics_test PRIVATE vds_protocol ${VDS_OPUS_TARGET})
+    add_executable(vds_scheduler_test diagnostics/scheduler_test.cc)
+    add_dependencies(vds_scheduler_test vds_build_info_header)
+    target_include_directories(vds_scheduler_test PRIVATE ${VDS_GENERATED_DIR})
+    target_link_libraries(vds_scheduler_test PRIVATE vds_protocol jsonl vds_bt
+      vds_common vds_config vds_hidhide vds_log vds_io vds_usbip vds_win32
+      vdsd_common winmm ${VDS_OPUS_TARGET})
+    foreach(test_target vds_metrics_test vds_scheduler_test)
+      add_custom_command(TARGET ${test_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:${VDS_OPUS_TARGET}>" "$<TARGET_FILE_DIR:${test_target}>")
+      add_test(NAME ${test_target} COMMAND ${test_target})
+      set_tests_properties(${test_target} PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endforeach()
+  endif()
 else()
   add_library(vds_bt OBJECT src/platform/linux/vds_bt.cc)
   target_link_libraries(vds_bt PUBLIC vds_protocol vds_io PkgConfig::BLUEZ)
