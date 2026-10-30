@@ -61,3 +61,8 @@
 !/src/**/*.hh
 !/src/**/*.hpp
 !/src/**/*.hxx
+
+!/diagnostics/
+!/diagnostics/*.cc
+!/diagnostics/*.ps1
+!/diagnostics/*.py

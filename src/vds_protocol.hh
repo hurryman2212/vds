@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -47,13 +48,28 @@ enum class BtInputPayloadType {
 };
 
 struct AudioChunk {
+  std::chrono::steady_clock::time_point queued_at{};
   HapticsChunk haptics;
   SpeakerChunk speaker;
   bool has_signal = false;
   bool has_haptics_signal = false;
+  // Diagnostic energy totals in 16-bit PCM units, over the same time window.
+  double diagnostic_raw_energy = 0;
+  double diagnostic_average_energy = 0;
+  double diagnostic_quantized_energy = 0;
+  std::uint64_t diagnostic_raw_count = 0;
+  std::uint64_t diagnostic_nonzero_averages = 0;
+  std::uint64_t diagnostic_erased_averages = 0;
+  std::uint64_t diagnostic_clipped_samples = 0;
+  int diagnostic_gain_percent = 100;
+  int diagnostic_raw_peak = 0;
+  int diagnostic_output_peak = 0;
 };
 
 void fill_output_report_checksum(std::span<std::uint8_t> report);
+// Call at physical submission, after queue drops, to sequence all report types.
+void sequence_output_report(std::span<std::uint8_t> report, std::uint8_t &sequence);
+void amplify_rumble_report(std::span<std::uint8_t> report, int gain_percent);
 void fill_feature_report_checksum(std::span<std::uint8_t> report);
 std::vector<std::uint8_t>
 hidp_output_packet(std::span<const std::uint8_t> report);
@@ -135,6 +151,7 @@ private:
 class PcmAudioExtractor {
 public:
   explicit PcmAudioExtractor(std::size_t pcm_window_frames = kPcmWindowFrames);
+  void set_haptics_gain(int percent);
   ~PcmAudioExtractor();
 
   PcmAudioExtractor(PcmAudioExtractor &&) noexcept;
@@ -155,6 +172,7 @@ private:
   PcmWindow speaker_pcm_{};
   PcmWindow haptics_pcm_{};
   std::size_t pcm_window_frames_ = kPcmWindowFrames;
+  int haptics_gain_percent_ = 100;
   std::size_t pending_frame_pos_ = 0;
   std::size_t pcm_window_frame_pos_ = 0;
   bool chunk_has_signal_ = false;
